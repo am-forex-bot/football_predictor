@@ -46,7 +46,6 @@ COUNTRIES = {
 }
 
 BASE_URL = "https://www.football-data.co.uk/mmz4281"
-FIXTURES_URL = "https://www.football-data.co.uk/fixtures.csv"
 
 
 def get_results_url(code: str, season: str | None = None) -> str:

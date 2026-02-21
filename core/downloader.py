@@ -8,7 +8,7 @@ import pandas as pd
 import requests
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
-from core.leagues import FIXTURES_URL, get_results_url
+from core.leagues import get_results_url
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -36,22 +36,17 @@ def _fetch_csv(url: str, retries: int = 5) -> str:
 
 
 def download_results(league_code: str, season: str | None = None) -> pd.DataFrame:
-    """Download a league's season results CSV and return as DataFrame."""
+    """Download a league's season CSV and return as DataFrame.
+
+    The season CSV contains both completed results (FTR filled) and
+    upcoming fixtures (FTR empty).  The cleaner separates them later.
+    """
     url = get_results_url(league_code, season)
     text = _fetch_csv(url)
     # football-data CSVs sometimes have a BOM
     if text.startswith("\ufeff"):
         text = text[1:]
     return pd.read_csv(StringIO(text))
-
-
-def download_fixtures(league_code: str) -> pd.DataFrame:
-    """Download the shared fixtures CSV and filter to the given league."""
-    text = _fetch_csv(FIXTURES_URL)
-    if text.startswith("\ufeff"):
-        text = text[1:]
-    df = pd.read_csv(StringIO(text))
-    return df[df["Div"] == league_code].reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +57,7 @@ class DownloadWorker(QObject):
     """Runs downloads in a background thread, emitting progress signals."""
 
     progress = pyqtSignal(str)       # log message
-    finished = pyqtSignal(dict)      # {"results": DataFrame, "fixtures": DataFrame}
+    finished = pyqtSignal(dict)      # {"results": DataFrame}
     error = pyqtSignal(str)          # error message
 
     def __init__(self, league_code: str, season: str | None = None):
@@ -72,17 +67,15 @@ class DownloadWorker(QObject):
 
     def run(self):
         try:
-            self.progress.emit(f"Downloading results for {self.league_code}...")
+            self.progress.emit(f"Downloading data for {self.league_code}...")
             results_df = download_results(self.league_code, self.season)
-            self.progress.emit(f"  Got {len(results_df)} rows of match data.")
-
-            time.sleep(random.uniform(2, 4))  # polite delay between requests
-
-            self.progress.emit(f"Downloading fixtures for {self.league_code}...")
-            fixtures_df = download_fixtures(self.league_code)
-            self.progress.emit(f"  Got {len(fixtures_df)} upcoming fixtures.")
-
-            self.finished.emit({"results": results_df, "fixtures": fixtures_df})
+            total = len(results_df)
+            played = results_df["FTR"].notna().sum()
+            upcoming = total - played
+            self.progress.emit(
+                f"  Got {played} results and {upcoming} upcoming fixtures."
+            )
+            self.finished.emit({"results": results_df})
         except Exception as exc:
             self.error.emit(str(exc))
 

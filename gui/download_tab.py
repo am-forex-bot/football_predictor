@@ -178,9 +178,8 @@ class DownloadTab(QWidget):
 
         try:
             results_df = data["results"]
-            fixtures_df = data["fixtures"]
             output = get_workbook_path(code)
-            summary = process_and_save(results_df, fixtures_df, output)
+            summary = process_and_save(results_df, None, output)
             record_download(code, name, summary["results_count"],
                             summary["fixtures_count"], summary["teams"])
 
