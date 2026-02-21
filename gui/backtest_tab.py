@@ -41,11 +41,12 @@ class _BacktestWorker(QObject):
                 self.t_min, self.t_max, self.lb_min, self.lb_max,
             )
 
-            # Weekly performance analysis
+            # Weekly performance — reuses backtest cache (no double scoring)
             weekly = predictor.weekly_performance(
                 self.results_df, self.table_df,
                 self.t_min, self.t_max, self.lb_min, self.lb_max,
                 min_week_games=self.min_week_games,
+                backtest_result=result,
             )
 
             result["weekly"] = weekly
