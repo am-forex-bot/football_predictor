@@ -1,4 +1,9 @@
-"""Download match data from football-data.co.uk."""
+"""Download match data from football-data.co.uk.
+
+Downloads both the season results CSV (which may contain upcoming fixtures
+as rows with no FTR) AND the dedicated fixtures.csv which has all upcoming
+fixtures across all leagues.
+"""
 
 import random
 import time
@@ -16,6 +21,8 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
 ]
+
+FIXTURES_URL = "https://www.football-data.co.uk/fixtures.csv"
 
 
 def _fetch_csv(url: str, retries: int = 5) -> str:
@@ -35,18 +42,24 @@ def _fetch_csv(url: str, retries: int = 5) -> str:
     raise RuntimeError(f"Failed to download {url}")
 
 
-def download_results(league_code: str, season: str | None = None) -> pd.DataFrame:
-    """Download a league's season CSV and return as DataFrame.
-
-    The season CSV contains both completed results (FTR filled) and
-    upcoming fixtures (FTR empty).  The cleaner separates them later.
-    """
-    url = get_results_url(league_code, season)
-    text = _fetch_csv(url)
-    # football-data CSVs sometimes have a BOM
+def _parse_csv_text(text: str) -> pd.DataFrame:
+    """Parse CSV text, handling BOM and encoding issues."""
     if text.startswith("\ufeff"):
         text = text[1:]
     return pd.read_csv(StringIO(text))
+
+
+def download_results(league_code: str, season: str | None = None) -> pd.DataFrame:
+    """Download a league's season CSV and return as DataFrame."""
+    url = get_results_url(league_code, season)
+    text = _fetch_csv(url)
+    return _parse_csv_text(text)
+
+
+def download_fixtures() -> pd.DataFrame:
+    """Download the global fixtures.csv from football-data.co.uk."""
+    text = _fetch_csv(FIXTURES_URL)
+    return _parse_csv_text(text)
 
 
 # ---------------------------------------------------------------------------
@@ -56,9 +69,9 @@ def download_results(league_code: str, season: str | None = None) -> pd.DataFram
 class DownloadWorker(QObject):
     """Runs downloads in a background thread, emitting progress signals."""
 
-    progress = pyqtSignal(str)       # log message
-    finished = pyqtSignal(dict)      # {"results": DataFrame}
-    error = pyqtSignal(str)          # error message
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
 
     def __init__(self, league_code: str, season: str | None = None):
         super().__init__()
@@ -67,15 +80,40 @@ class DownloadWorker(QObject):
 
     def run(self):
         try:
-            self.progress.emit(f"Downloading data for {self.league_code}...")
+            self.progress.emit(f"Downloading results for {self.league_code}...")
             results_df = download_results(self.league_code, self.season)
             total = len(results_df)
             played = results_df["FTR"].notna().sum()
             upcoming = total - played
             self.progress.emit(
-                f"  Got {played} results and {upcoming} upcoming fixtures."
+                f"  Results: {played} played, {upcoming} upcoming in season CSV."
             )
-            self.finished.emit({"results": results_df})
+
+            # Also download the dedicated fixtures file
+            self.progress.emit("Downloading fixtures.csv (all leagues)...")
+            try:
+                fixtures_df = download_fixtures()
+                if "Div" in fixtures_df.columns:
+                    league_fixtures = fixtures_df[
+                        fixtures_df["Div"] == self.league_code
+                    ].copy()
+                    self.progress.emit(
+                        f"  Fixtures: {len(league_fixtures)} upcoming for {self.league_code} "
+                        f"(from {len(fixtures_df)} total across all leagues)."
+                    )
+                else:
+                    league_fixtures = fixtures_df
+                    self.progress.emit(
+                        f"  Fixtures: {len(fixtures_df)} rows (no Div column to filter)."
+                    )
+            except Exception as e:
+                self.progress.emit(f"  Warning: Could not download fixtures.csv: {e}")
+                league_fixtures = pd.DataFrame()
+
+            self.finished.emit({
+                "results": results_df,
+                "fixtures": league_fixtures,
+            })
         except Exception as exc:
             self.error.emit(str(exc))
 

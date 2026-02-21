@@ -43,17 +43,37 @@ def clean_results(raw_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def extract_fixtures(raw_df: pd.DataFrame) -> pd.DataFrame:
-    """Extract upcoming fixtures (rows where FTR is NaN but teams exist)."""
-    mask = raw_df["FTR"].isna() | (raw_df["FTR"] == "")
-    mask &= raw_df["HomeTeam"].notna()
-    mask &= raw_df["AwayTeam"].notna()
+    """Extract upcoming fixtures (rows where FTR is NaN but teams exist).
+
+    Handles both formats:
+    - Season CSV: has FTR column, fixtures are rows where FTR is empty
+    - Dedicated fixtures.csv: may not have FTR at all, all rows are fixtures
+    """
+    if raw_df.empty:
+        return pd.DataFrame(columns=["Team", "Opponent"])
+
+    # Determine home/away column names
+    if "HomeTeam" in raw_df.columns:
+        home_col, away_col = "HomeTeam", "AwayTeam"
+    elif "Team" in raw_df.columns:
+        home_col, away_col = "Team", "Opponent"
+    else:
+        return pd.DataFrame(columns=["Team", "Opponent"])
+
+    if "FTR" in raw_df.columns:
+        mask = raw_df["FTR"].isna() | (raw_df["FTR"] == "")
+    else:
+        # No FTR column = all rows are fixtures
+        mask = pd.Series(True, index=raw_df.index)
+
+    mask &= raw_df[home_col].notna()
+    mask &= raw_df[away_col].notna()
     df = raw_df.loc[mask].copy()
 
     result = pd.DataFrame()
-    result["Team"] = df["HomeTeam"].values
-    result["Opponent"] = df["AwayTeam"].values
+    result["Team"] = df[home_col].values
+    result["Opponent"] = df[away_col].values
 
-    # Include odds if present
     for src, dst in [("B365H", "Home_Odds"), ("B365D", "Draw_Odds"), ("B365A", "Away_Odds")]:
         if src in df.columns:
             result[dst] = pd.to_numeric(df[src].values, errors="coerce")
@@ -138,6 +158,7 @@ def process_and_save(raw_df: pd.DataFrame, fixtures_raw_df: pd.DataFrame | None,
                      output_path: str) -> dict:
     """Full pipeline: clean results, extract/merge fixtures, build table, save.
 
+    fixtures_raw_df: dedicated fixtures DataFrame (already filtered to this league).
     Returns a summary dict with counts.
     """
     results = clean_results(raw_df)

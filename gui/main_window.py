@@ -6,6 +6,7 @@ from PyQt6.QtCore import Qt
 from gui.download_tab import DownloadTab
 from gui.prediction_tab import PredictionTab
 from gui.backtest_tab import BacktestTab
+from gui.tuner_tab import TunerTab
 
 
 class MainWindow(QMainWindow):
@@ -13,7 +14,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Football Predictor")
         self.setMinimumSize(1050, 720)
-        self.resize(1100, 780)
+        self.resize(1200, 820)
 
         # Central tab widget
         self.tabs = QTabWidget()
@@ -29,12 +30,14 @@ class MainWindow(QMainWindow):
         self.download_tab = DownloadTab(self)
         self.prediction_tab = PredictionTab(self)
         self.backtest_tab = BacktestTab(self)
+        self.tuner_tab = TunerTab(self)
 
         self.tabs.addTab(self.download_tab, "  Download  ")
         self.tabs.addTab(self.prediction_tab, "  Predict  ")
         self.tabs.addTab(self.backtest_tab, "  Backtest  ")
+        self.tabs.addTab(self.tuner_tab, "  Tune Weights  ")
 
-        # Refresh prediction/backtest league lists when switching tabs
+        # Refresh league lists when switching tabs
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
     def set_status(self, message: str):
@@ -45,3 +48,5 @@ class MainWindow(QMainWindow):
             self.prediction_tab.refresh_leagues()
         elif index == 2:
             self.backtest_tab.refresh_leagues()
+        elif index == 3:
+            self.tuner_tab.refresh_leagues()

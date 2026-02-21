@@ -129,7 +129,7 @@ QComboBox QAbstractItemView {
 }
 
 /* ===== Spin Boxes ===== */
-QSpinBox {
+QSpinBox, QDoubleSpinBox {
     background-color: #313244;
     border: 1px solid #45475a;
     border-radius: 6px;
@@ -138,7 +138,7 @@ QSpinBox {
     color: #cdd6f4;
 }
 
-QSpinBox:hover {
+QSpinBox:hover, QDoubleSpinBox:hover {
     border-color: #7c3aed;
 }
 
