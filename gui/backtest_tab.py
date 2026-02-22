@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt6.QtGui import QColor
 
-from core.data_manager import get_available_leagues, load_league_data
+from core.data_manager import get_available_leagues, load_league_data, load_backtest_data
 from core.predictor import MatchPredictor, PredictorConfig
 
 
@@ -239,7 +239,20 @@ class BacktestTab(QWidget):
             return
 
         results_df, _, table_df = data
-        self._last_results_df = results_df
+
+        # Use multi-season data for backtesting if available
+        backtest_df = load_backtest_data(code)
+        if backtest_df is not None and len(backtest_df) > len(results_df):
+            bt_results = backtest_df
+            n_seasons = backtest_df["Season"].nunique() if "Season" in backtest_df.columns else 1
+            self.main_window.set_status(
+                f"Running backtest on {len(bt_results)} matches across {n_seasons} seasons..."
+            )
+        else:
+            bt_results = results_df
+            self.main_window.set_status("Running backtest (single season)...")
+
+        self._last_results_df = bt_results
         self._last_table_df = table_df
 
         t_min = self.t_min_spin.value()
@@ -249,10 +262,9 @@ class BacktestTab(QWidget):
         min_week = self.min_week_spin.value()
 
         self.run_btn.setEnabled(False)
-        self.main_window.set_status("Running backtest...")
 
         self._thread = QThread()
-        self._worker = _BacktestWorker(results_df, table_df, t_min, t_max,
+        self._worker = _BacktestWorker(bt_results, table_df, t_min, t_max,
                                        lb_min, lb_max, min_week)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -282,8 +294,17 @@ class BacktestTab(QWidget):
         self._fill_stats(thresholds, lookbacks, accuracy, draw_stats, odds_stats,
                          roi_stats, weekly)
 
+        # Count matches and seasons
+        n_matches = 0
+        if self._last_results_df is not None:
+            n_matches = len(self._last_results_df)
+        n_seasons = 1
+        if self._last_results_df is not None and "Season" in self._last_results_df.columns:
+            n_seasons = self._last_results_df["Season"].nunique()
+
         self.main_window.set_status(
-            f"Backtest complete. Best accuracy: T={best[0]} LB={best[1]} -> {best[2]:.1f}% | "
+            f"Backtest complete ({n_matches} matches, {n_seasons} seasons). "
+            f"Best accuracy: T={best[0]} LB={best[1]} -> {best[2]:.1f}% | "
             f"Best ROI (B365): T={best_roi[0]} LB={best_roi[1]} -> {best_roi[2]:+.1f}%"
         )
 

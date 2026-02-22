@@ -13,7 +13,7 @@ import pandas as pd
 import requests
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
-from core.leagues import get_results_url
+from core.leagues import get_results_url, get_past_season_codes, season_display
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -56,6 +56,27 @@ def download_results(league_code: str, season: str | None = None) -> pd.DataFram
     return _parse_csv_text(text)
 
 
+def download_results_multi(league_code: str, n_seasons: int = 5,
+                           progress_callback=None) -> list[tuple[str, pd.DataFrame]]:
+    """Download multiple seasons. Returns [(season_code, df), ...] oldest first.
+
+    Skips seasons that fail (e.g. league didn't exist yet) and continues.
+    """
+    codes = get_past_season_codes(n_seasons)
+    results = []
+    for i, code in enumerate(reversed(codes)):  # oldest first
+        if progress_callback:
+            progress_callback(f"Downloading {season_display(code)} ({i+1}/{n_seasons})...")
+        try:
+            df = download_results(league_code, code)
+            if len(df) > 0:
+                results.append((code, df))
+        except Exception:
+            if progress_callback:
+                progress_callback(f"  Season {season_display(code)} not available, skipping")
+    return results
+
+
 def download_fixtures() -> pd.DataFrame:
     """Download the global fixtures.csv from football-data.co.uk."""
     text = _fetch_csv(FIXTURES_URL)
@@ -73,20 +94,39 @@ class DownloadWorker(QObject):
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
 
-    def __init__(self, league_code: str, season: str | None = None):
+    def __init__(self, league_code: str, n_seasons: int = 1, season: str | None = None):
         super().__init__()
         self.league_code = league_code
+        self.n_seasons = n_seasons
         self.season = season
 
     def run(self):
         try:
-            self.progress.emit(f"Downloading results for {self.league_code}...")
-            results_df = download_results(self.league_code, self.season)
-            total = len(results_df)
-            played = results_df["FTR"].notna().sum()
+            if self.n_seasons > 1:
+                # Multi-season download
+                self.progress.emit(
+                    f"Downloading {self.n_seasons} seasons for {self.league_code}..."
+                )
+                season_data = download_results_multi(
+                    self.league_code, self.n_seasons,
+                    progress_callback=lambda msg: self.progress.emit(msg),
+                )
+                self.progress.emit(
+                    f"  Got {len(season_data)} seasons of data"
+                )
+
+                # Current season is the last one (most recent)
+                current_df = season_data[-1][1] if season_data else pd.DataFrame()
+            else:
+                self.progress.emit(f"Downloading results for {self.league_code}...")
+                current_df = download_results(self.league_code, self.season)
+                season_data = None  # single season mode
+
+            total = len(current_df)
+            played = current_df["FTR"].notna().sum() if "FTR" in current_df.columns else 0
             upcoming = total - played
             self.progress.emit(
-                f"  Results: {played} played, {upcoming} upcoming in season CSV."
+                f"  Current season: {played} played, {upcoming} upcoming."
             )
 
             # Also download the dedicated fixtures file
@@ -111,17 +151,19 @@ class DownloadWorker(QObject):
                 league_fixtures = pd.DataFrame()
 
             self.finished.emit({
-                "results": results_df,
+                "results": current_df,
                 "fixtures": league_fixtures,
+                "season_data": season_data,  # list of (code, df) or None
             })
         except Exception as exc:
             self.error.emit(str(exc))
 
 
-def start_download(league_code: str, season: str | None = None) -> tuple[QThread, DownloadWorker]:
+def start_download(league_code: str, n_seasons: int = 1,
+                   season: str | None = None) -> tuple[QThread, DownloadWorker]:
     """Create and start a download worker thread. Returns (thread, worker)."""
     thread = QThread()
-    worker = DownloadWorker(league_code, season)
+    worker = DownloadWorker(league_code, n_seasons=n_seasons, season=season)
     worker.moveToThread(thread)
     thread.started.connect(worker.run)
     worker.finished.connect(thread.quit)

@@ -19,6 +19,36 @@ def get_current_season_code() -> str:
     return f"{start_year % 100:02d}{end_year % 100:02d}"
 
 
+def get_past_season_codes(n_seasons: int) -> list[str]:
+    """Return season codes for the current + N-1 previous seasons.
+
+    E.g. n_seasons=5 in Feb 2026 → ['2526', '2425', '2324', '2223', '2122']
+    Most recent first.
+    """
+    today = date.today()
+    year = today.year
+    if today.month < 8:
+        start_year = year - 1
+    else:
+        start_year = year
+
+    codes = []
+    for i in range(n_seasons):
+        sy = start_year - i
+        ey = sy + 1
+        codes.append(f"{sy % 100:02d}{ey % 100:02d}")
+    return codes
+
+
+def season_display(code: str) -> str:
+    """Convert season code to display string: '2526' → '2025-26'."""
+    s = int(code[:2])
+    e = int(code[2:])
+    # Handle century boundary (e.g. 9900 → 1999-00)
+    century_s = 2000 if s < 50 else 1900
+    return f"{century_s + s}-{e:02d}"
+
+
 # Each league entry: display name → dict with football-data code and team count
 COUNTRIES = {
     "England": {

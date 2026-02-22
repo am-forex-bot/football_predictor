@@ -498,17 +498,54 @@ class MatchPredictor:
 
         return accuracy, draw_stats, odds_stats, roi_stats, best_acc, best_roi, lookback_cache
 
+    def _score_multi_season(self, results_df: pd.DataFrame) -> tuple:
+        """Score multi-season data using per-season category maps.
+
+        Each season's matches are scored using that season's league table,
+        so team categories reflect their actual standing at the time.
+        Form (prefix sums) carries across season boundaries.
+        """
+        from core.cleaner import build_league_table
+
+        if "Season" not in results_df.columns:
+            raise ValueError("Multi-season data requires a 'Season' column")
+
+        seasons = results_df["Season"].unique()
+        all_home_scores = np.empty(len(results_df), dtype=np.float64)
+        all_away_scores = np.empty(len(results_df), dtype=np.float64)
+
+        for season in seasons:
+            mask = results_df["Season"] == season
+            season_df = results_df[mask]
+            # Build league table from this season's matches → categories for this season
+            season_table = build_league_table(season_df)
+            cat_map = infer_categories(season_table)
+            h_scores, a_scores = self._vectorized_score(season_df, cat_map)
+            indices = np.where(mask)[0]
+            all_home_scores[indices] = h_scores
+            all_away_scores[indices] = a_scores
+
+        return all_home_scores, all_away_scores
+
     def backtest(self, results_df: pd.DataFrame,
                  league_table_df: pd.DataFrame,
                  threshold_min: int = 1, threshold_max: int = 20,
                  lookback_min: int = 3, lookback_max: int = 20) -> dict:
         """Grid search across threshold/lookback combos.
 
+        Handles both single-season and multi-season data. If results_df has a
+        'Season' column, builds per-season category maps for correct scoring.
+        Form carries across season boundaries.
+
         Returns accuracy grid, draw stats, odds stats, ROI stats, best combos,
         and internal cache for weekly_performance reuse.
         """
-        cat_map = infer_categories(league_table_df)
-        home_scores, away_scores = self._vectorized_score(results_df, cat_map)
+        if "Season" in results_df.columns and results_df["Season"].nunique() > 1:
+            home_scores, away_scores = self._score_multi_season(results_df)
+        else:
+            cat_map = infer_categories(league_table_df)
+            home_scores, away_scores = self._vectorized_score(results_df, cat_map)
+
         pd_data = self._build_prefix_data(results_df, home_scores, away_scores)
 
         accuracy, draw_stats, odds_stats, roi_stats, best_acc, best_roi, lb_cache = self._run_grid(

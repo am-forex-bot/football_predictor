@@ -214,21 +214,51 @@ def build_league_table(results_df: pd.DataFrame) -> pd.DataFrame:
     return table
 
 
+def combine_seasons(season_data: list[tuple[str, pd.DataFrame]]) -> pd.DataFrame:
+    """Combine multiple seasons into one results DataFrame with Season column.
+
+    season_data: [(season_code, raw_df), ...] in chronological order (oldest first).
+    Each season's matches are cleaned and tagged with their season code.
+    """
+    all_results = []
+    for season_code, raw_df in season_data:
+        try:
+            cleaned = clean_results(raw_df)
+            cleaned["Season"] = season_code
+            all_results.append(cleaned)
+        except (KeyError, ValueError):
+            continue  # skip seasons with bad data
+
+    if not all_results:
+        return pd.DataFrame()
+
+    return pd.concat(all_results, ignore_index=True)
+
+
 def save_workbook(results_df: pd.DataFrame, fixtures_df: pd.DataFrame,
-                  league_table_df: pd.DataFrame, path: str):
-    """Save all three DataFrames into a single Excel workbook."""
+                  league_table_df: pd.DataFrame, path: str,
+                  backtest_results_df: pd.DataFrame | None = None):
+    """Save DataFrames into a single Excel workbook.
+
+    If backtest_results_df is provided (multi-season), saves it as a separate
+    'Backtest Results' sheet for thorough backtesting.
+    """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         results_df.to_excel(writer, sheet_name="Results", index=False)
         fixtures_df.to_excel(writer, sheet_name="Fixtures", index=False)
         league_table_df.to_excel(writer, sheet_name="League Table", index=False)
+        if backtest_results_df is not None and not backtest_results_df.empty:
+            backtest_results_df.to_excel(writer, sheet_name="Backtest Results", index=False)
 
 
 def process_and_save(raw_df: pd.DataFrame, fixtures_raw_df: pd.DataFrame | None,
-                     output_path: str) -> dict:
+                     output_path: str,
+                     season_data: list[tuple[str, pd.DataFrame]] | None = None) -> dict:
     """Full pipeline: clean results, extract/merge fixtures, build table, save.
 
     fixtures_raw_df: dedicated fixtures DataFrame (already filtered to this league).
+    season_data: optional list of (season_code, raw_df) for multi-season backtest data.
     Returns a summary dict with counts.
     """
     results = clean_results(raw_df)
@@ -246,10 +276,19 @@ def process_and_save(raw_df: pd.DataFrame, fixtures_raw_df: pd.DataFrame | None,
     else:
         fixtures = fixtures_from_csv
 
-    save_workbook(results, fixtures, table, output_path)
+    # Multi-season backtest data
+    backtest_df = None
+    n_seasons = 1
+    if season_data and len(season_data) > 1:
+        backtest_df = combine_seasons(season_data)
+        n_seasons = len(season_data)
+
+    save_workbook(results, fixtures, table, output_path, backtest_df)
 
     return {
         "results_count": len(results),
         "fixtures_count": len(fixtures),
         "teams": len(table),
+        "backtest_matches": len(backtest_df) if backtest_df is not None else len(results),
+        "n_seasons": n_seasons,
     }

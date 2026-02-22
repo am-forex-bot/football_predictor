@@ -37,7 +37,8 @@ def get_workbook_path(league_code: str) -> str:
 
 
 def record_download(league_code: str, league_name: str, results_count: int,
-                    fixtures_count: int, teams: int):
+                    fixtures_count: int, teams: int,
+                    backtest_matches: int = 0, n_seasons: int = 1):
     """Record that a league was just downloaded."""
     meta = _load_meta()
     meta[league_code] = {
@@ -46,6 +47,8 @@ def record_download(league_code: str, league_name: str, results_count: int,
         "results_count": results_count,
         "fixtures_count": fixtures_count,
         "teams": teams,
+        "n_seasons": n_seasons,
+        "backtest_matches": backtest_matches,
         "file": get_workbook_path(league_code),
     }
     _save_meta(meta)
@@ -101,6 +104,22 @@ def load_league_data(league_code: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
     fixtures = pd.read_excel(path, sheet_name="Fixtures")
     table = pd.read_excel(path, sheet_name="League Table")
     return results, fixtures, table
+
+
+def load_backtest_data(league_code: str) -> pd.DataFrame | None:
+    """Load multi-season backtest results if available.
+
+    Returns the 'Backtest Results' sheet (all seasons combined with Season column),
+    or None if only single-season data exists.
+    """
+    path = get_workbook_path(league_code)
+    if not os.path.exists(path):
+        return None
+    try:
+        return pd.read_excel(path, sheet_name="Backtest Results")
+    except ValueError:
+        # Sheet doesn't exist — single-season data only
+        return None
 
 
 def clean_league(league_code: str):
