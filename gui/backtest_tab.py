@@ -1,7 +1,7 @@
-"""Backtest tab — historical accuracy testing with weekly performance tracking.
+"""Backtest tab — historical accuracy AND profitability testing.
 
-Grids across threshold/lookback, shows accuracy heatmap, and tracks
-perfect gameweeks (100%, 90%, 80%, 70%).
+Grids across threshold/lookback showing accuracy heatmap AND ROI heatmap.
+Weekly performance tracks both accuracy and profit per gameweek.
 """
 
 from PyQt6.QtWidgets import (
@@ -35,13 +35,11 @@ class _BacktestWorker(QObject):
         try:
             predictor = MatchPredictor(PredictorConfig())
 
-            # Main backtest
             result = predictor.backtest(
                 self.results_df, self.table_df,
                 self.t_min, self.t_max, self.lb_min, self.lb_max,
             )
 
-            # Weekly performance — reuses backtest cache (no double scoring)
             weekly = predictor.weekly_performance(
                 self.results_df, self.table_df,
                 self.t_min, self.t_max, self.lb_min, self.lb_max,
@@ -115,7 +113,7 @@ class BacktestTab(QWidget):
         # --- Sub-tabs for results ---
         self.result_tabs = QTabWidget()
 
-        # Accuracy grid tab
+        # 1. Accuracy grid tab
         grid_widget = QWidget()
         grid_layout = QVBoxLayout(grid_widget)
         self.grid_table = QTableWidget()
@@ -127,7 +125,19 @@ class BacktestTab(QWidget):
         grid_layout.addWidget(self.best_label)
         self.result_tabs.addTab(grid_widget, "Accuracy Grid")
 
-        # Weekly performance tab
+        # 2. ROI grid tab (the money maker)
+        roi_widget = QWidget()
+        roi_layout = QVBoxLayout(roi_widget)
+        self.roi_table = QTableWidget()
+        self.roi_table.setAlternatingRowColors(False)
+        self.roi_table.verticalHeader().setVisible(True)
+        roi_layout.addWidget(self.roi_table)
+        self.roi_label = QLabel("")
+        self.roi_label.setProperty("heading", True)
+        roi_layout.addWidget(self.roi_label)
+        self.result_tabs.addTab(roi_widget, "ROI Grid (Profit)")
+
+        # 3. Weekly performance tab
         weekly_widget = QWidget()
         weekly_layout = QVBoxLayout(weekly_widget)
         self.weekly_table = QTableWidget()
@@ -197,13 +207,32 @@ class BacktestTab(QWidget):
         accuracy = result["accuracy"]
         draw_stats = result["draw_stats"]
         odds_stats = result["odds_stats"]
+        roi_stats = result.get("roi_stats", {})
         best = result["best"]
+        best_roi = result.get("best_roi", (0, 0, -999))
         weekly = result.get("weekly", [])
 
         thresholds = sorted(accuracy.keys())
         lookbacks = sorted({lb for t in accuracy.values() for lb in t})
 
-        # --- Fill accuracy grid ---
+        # === ACCURACY GRID ===
+        self._fill_accuracy_grid(thresholds, lookbacks, accuracy, best)
+
+        # === ROI GRID ===
+        self._fill_roi_grid(thresholds, lookbacks, roi_stats, best_roi)
+
+        # === WEEKLY PERFORMANCE ===
+        self._fill_weekly_table(weekly)
+
+        # === DETAILED STATS ===
+        self._fill_stats(thresholds, lookbacks, accuracy, draw_stats, odds_stats, roi_stats, weekly)
+
+        self.main_window.set_status(
+            f"Backtest complete. Best accuracy: T={best[0]} LB={best[1]} -> {best[2]:.1f}% | "
+            f"Best ROI: T={best_roi[0]} LB={best_roi[1]} -> {best_roi[2]:+.1f}%"
+        )
+
+    def _fill_accuracy_grid(self, thresholds, lookbacks, accuracy, best):
         self.grid_table.setRowCount(len(thresholds))
         self.grid_table.setColumnCount(len(lookbacks))
         self.grid_table.setHorizontalHeaderLabels([f"LB {lb}" for lb in lookbacks])
@@ -241,16 +270,81 @@ class BacktestTab(QWidget):
         self.grid_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch
         )
-
         self.best_label.setText(
             f"Best: Threshold={best[0]}, Lookback={best[1]}, Accuracy={best[2]:.1f}%"
         )
 
-        # --- Fill weekly performance table ---
+    def _fill_roi_grid(self, thresholds, lookbacks, roi_stats, best_roi):
+        self.roi_table.setRowCount(len(thresholds))
+        self.roi_table.setColumnCount(len(lookbacks))
+        self.roi_table.setHorizontalHeaderLabels([f"LB {lb}" for lb in lookbacks])
+        self.roi_table.setVerticalHeaderLabels([f"T={t}" for t in thresholds])
+
+        all_roi = []
+        for t in thresholds:
+            for lb in lookbacks:
+                rs = roi_stats.get(t, {}).get(lb, {})
+                all_roi.append(rs.get("roi_pct", 0.0))
+
+        min_roi = min(all_roi) if all_roi else -100
+        max_roi = max(all_roi) if all_roi else 100
+
+        for r, t in enumerate(thresholds):
+            for c, lb in enumerate(lookbacks):
+                rs = roi_stats.get(t, {}).get(lb, {})
+                roi_pct = rs.get("roi_pct", 0.0)
+                profit = rs.get("profit", 0.0)
+                stakes = rs.get("stakes", 0)
+
+                # Show ROI% and profit in units
+                if stakes > 0:
+                    text = f"{roi_pct:+.1f}%"
+                else:
+                    text = "-"
+
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item.setToolTip(
+                    f"ROI: {roi_pct:+.1f}%\n"
+                    f"Profit: {profit:+.1f} units\n"
+                    f"Bets: {stakes}\n"
+                    f"Returns: {rs.get('returns', 0):.1f}"
+                )
+
+                # Color: green for profit, red for loss
+                if roi_pct > 0:
+                    intensity = min(roi_pct / 30.0, 1.0)  # saturate at +30%
+                    item.setBackground(QColor(40, int(80 + 120 * intensity), 40, 120))
+                    item.setForeground(QColor("#22c55e"))
+                elif roi_pct < 0:
+                    intensity = min(abs(roi_pct) / 30.0, 1.0)
+                    item.setBackground(QColor(int(80 + 120 * intensity), 40, 40, 120))
+                    item.setForeground(QColor("#ef4444"))
+
+                if t == best_roi[0] and lb == best_roi[1]:
+                    item.setBackground(QColor("#7c3aed"))
+                    item.setForeground(QColor("#ffffff"))
+
+                self.roi_table.setItem(r, c, item)
+
+        self.roi_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+
+        if best_roi[2] > -999:
+            self.roi_label.setText(
+                f"Best ROI: Threshold={best_roi[0]}, Lookback={best_roi[1]}, "
+                f"ROI={best_roi[2]:+.1f}% (flat £1 staking, best available odds)"
+            )
+        else:
+            self.roi_label.setText("No combos with enough bets (need 20+) to calculate ROI")
+
+    def _fill_weekly_table(self, weekly):
         weekly_cols = [
             "Threshold", "Lookback", "Accuracy%", "Games",
-            "Perfect Weeks", "90%+ Weeks", "80%+ Weeks", "70%+ Weeks",
-            "Weeks Tested",
+            "Perfect Weeks", "90%+", "80%+", "70%+",
+            "Weeks Tested", "Total P&L", "ROI%",
+            "Best Week", "Profit Weeks",
         ]
         self.weekly_table.setSortingEnabled(False)
         self.weekly_table.setColumnCount(len(weekly_cols))
@@ -258,25 +352,42 @@ class BacktestTab(QWidget):
         self.weekly_table.setRowCount(len(weekly))
 
         for r, w in enumerate(weekly):
-            items = [
-                (str(w["threshold"]), None),
-                (str(w["lookback"]), None),
-                (f"{w['accuracy']:.1f}%", None),
-                (str(w["total_games"]), None),
-                (str(w["perfect_weeks"]), QColor("#22c55e") if w["perfect_weeks"] > 0 else None),
-                (str(w["weeks_ge90"]), QColor("#16a34a") if w["weeks_ge90"] > 0 else None),
-                (str(w["weeks_ge80"]), None),
-                (str(w["weeks_ge70"]), None),
-                (str(w["weeks_tested"]), None),
+            profit = w.get("total_profit", 0.0)
+            roi = w.get("total_roi_pct", 0.0)
+
+            items_data = [
+                (str(w["threshold"]), None, None),
+                (str(w["lookback"]), None, None),
+                (f"{w['accuracy']:.1f}%", None, None),
+                (str(w["total_games"]), None, None),
+                (str(w["perfect_weeks"]),
+                 QColor("#22c55e") if w["perfect_weeks"] > 0 else None, None),
+                (str(w["weeks_ge90"]),
+                 QColor("#16a34a") if w["weeks_ge90"] > 0 else None, None),
+                (str(w["weeks_ge80"]), None, None),
+                (str(w["weeks_ge70"]), None, None),
+                (str(w["weeks_tested"]), None, None),
+                (f"{profit:+.1f}",
+                 QColor("#22c55e") if profit > 0 else QColor("#ef4444") if profit < 0 else None,
+                 None),
+                (f"{roi:+.1f}%",
+                 QColor("#22c55e") if roi > 0 else QColor("#ef4444") if roi < 0 else None,
+                 None),
+                (f"{w.get('best_week_profit', 0):+.1f}", None, None),
+                (str(w.get("profitable_weeks", 0)), None, None),
             ]
-            for c, (text, highlight) in enumerate(items):
+
+            for c, (text, fg_color, bg_color) in enumerate(items_data):
                 item = QTableWidgetItem(text)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if highlight:
-                    item.setForeground(highlight)
+                if fg_color:
+                    item.setForeground(fg_color)
                 # Highlight rows with perfect weeks
                 if w["perfect_weeks"] > 0:
                     item.setBackground(QColor("#1a3a2a"))
+                # Highlight profitable rows
+                elif profit > 0:
+                    item.setBackground(QColor("#1a2a1a"))
                 self.weekly_table.setItem(r, c, item)
 
         self.weekly_table.setSortingEnabled(True)
@@ -284,42 +395,72 @@ class BacktestTab(QWidget):
             QHeaderView.ResizeMode.Stretch
         )
 
-        # Weekly summary
         if weekly:
+            # Find most profitable combo
+            best_profit = max(weekly, key=lambda w: w.get("total_profit", 0))
             top = weekly[0]
             self.weekly_label.setText(
-                f"Top combo: T={top['threshold']} LB={top['lookback']} — "
-                f"{top['perfect_weeks']} perfect weeks, "
-                f"{top['weeks_ge90']} at 90%+, "
-                f"{top['accuracy']:.1f}% overall"
+                f"Top accuracy combo: T={top['threshold']} LB={top['lookback']} — "
+                f"{top['perfect_weeks']} perfect weeks, {top['accuracy']:.1f}% overall | "
+                f"Most profitable: T={best_profit['threshold']} LB={best_profit['lookback']} — "
+                f"{best_profit.get('total_profit', 0):+.1f} units"
             )
         else:
             self.weekly_label.setText("No weekly data generated")
 
-        # --- Detailed stats ---
+    def _fill_stats(self, thresholds, lookbacks, accuracy, draw_stats, odds_stats, roi_stats, weekly):
         lines = []
+        lines.append("=" * 90)
+        lines.append(f"{'T':>3} {'LB':>3} | {'Acc%':>6} | {'Draws':>12} | "
+                     f"{'Avg Odds':>8} | {'ROI%':>7} | {'Profit':>8} | {'Bets':>5}")
+        lines.append("=" * 90)
+
         for t in thresholds:
             for lb in lookbacks:
                 ds = draw_stats.get(t, {}).get(lb, {"correct": 0, "predicted": 0})
                 os_data = odds_stats.get(t, {}).get(lb, {"combined": 0, "total": 0, "avg": 0})
+                rs = roi_stats.get(t, {}).get(lb, {})
                 acc = accuracy.get(t, {}).get(lb, 0)
                 draw_acc = (ds["correct"] / ds["predicted"] * 100) if ds["predicted"] > 0 else 0
-                # Find matching weekly row
-                w_match = next((w for w in weekly
-                                if w["threshold"] == t and w["lookback"] == lb), None)
-                perfect_str = ""
-                if w_match and w_match["perfect_weeks"] > 0:
-                    perfect_str = f" | PERFECT WEEKS: {w_match['perfect_weeks']}"
+                roi = rs.get("roi_pct", 0.0)
+                profit = rs.get("profit", 0.0)
+                stakes = rs.get("stakes", 0)
+
+                profit_marker = "+++" if roi > 10 else "++" if roi > 5 else "+" if roi > 0 else ""
+
                 lines.append(
-                    f"T={t:2d} LB={lb:2d} | Acc: {acc:5.1f}% | "
-                    f"Draws: {ds['correct']}/{ds['predicted']} ({draw_acc:.0f}%) | "
-                    f"Avg odds: {os_data.get('avg', 0):.2f}{perfect_str}"
+                    f"T={t:2d} LB={lb:2d} | {acc:5.1f}% | "
+                    f"{ds['correct']:3d}/{ds['predicted']:3d} ({draw_acc:4.0f}%) | "
+                    f"{os_data.get('avg', 0):7.2f} | "
+                    f"{roi:+6.1f}% | {profit:+7.1f}u | {stakes:4d} {profit_marker}"
                 )
 
+        # Separator and summary
+        lines.append("=" * 90)
+
+        # Find profitable combos
+        profitable = []
+        for t in thresholds:
+            for lb in lookbacks:
+                rs = roi_stats.get(t, {}).get(lb, {})
+                if rs.get("roi_pct", 0) > 0 and rs.get("stakes", 0) >= 20:
+                    profitable.append((t, lb, rs["roi_pct"], rs["profit"], rs["stakes"]))
+
+        profitable.sort(key=lambda x: x[2], reverse=True)
+
+        if profitable:
+            lines.append(f"\nPROFITABLE COMBOS (min 20 bets, best odds):")
+            for t, lb, roi, profit, stakes in profitable[:10]:
+                acc = accuracy.get(t, {}).get(lb, 0)
+                lines.append(
+                    f"  T={t:2d} LB={lb:2d} | Acc: {acc:.1f}% | "
+                    f"ROI: {roi:+.1f}% | Profit: {profit:+.1f}u over {stakes} bets"
+                )
+        else:
+            lines.append("\nNo profitable combos found (with 20+ bets). "
+                         "Try expanding the grid range or downloading more seasons.")
+
         self.stats_text.setPlainText("\n".join(lines))
-        self.main_window.set_status(
-            f"Backtest complete. Best: T={best[0]} LB={best[1]} -> {best[2]:.1f}%"
-        )
 
     def _on_error(self, msg: str):
         self.run_btn.setEnabled(True)

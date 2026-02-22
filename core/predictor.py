@@ -217,7 +217,7 @@ class MatchPredictor:
             home_prefix.append(np.concatenate([[0.0], np.cumsum(h_arr)]))
             away_prefix.append(np.concatenate([[0.0], np.cumsum(a_arr)]))
 
-        # Odds arrays
+        # Odds arrays — Bet365
         h_odds = (results_df["Home_Odds"].fillna(0.0).values.astype(np.float64)
                   if "Home_Odds" in results_df.columns
                   else np.zeros(N, dtype=np.float64))
@@ -227,6 +227,17 @@ class MatchPredictor:
         a_odds = (results_df["Away_Odds"].fillna(0.0).values.astype(np.float64)
                   if "Away_Odds" in results_df.columns
                   else np.zeros(N, dtype=np.float64))
+
+        # Max odds — best available price across all bookmakers
+        max_h_odds = (results_df["Max_Home_Odds"].fillna(0.0).values.astype(np.float64)
+                      if "Max_Home_Odds" in results_df.columns
+                      else h_odds.copy())
+        max_d_odds = (results_df["Max_Draw_Odds"].fillna(0.0).values.astype(np.float64)
+                      if "Max_Draw_Odds" in results_df.columns
+                      else d_odds.copy())
+        max_a_odds = (results_df["Max_Away_Odds"].fillna(0.0).values.astype(np.float64)
+                      if "Max_Away_Odds" in results_df.columns
+                      else a_odds.copy())
 
         # Actual results as integers
         result_vals = results_df["Result"].values
@@ -247,6 +258,9 @@ class MatchPredictor:
             "h_odds": h_odds,
             "d_odds": d_odds,
             "a_odds": a_odds,
+            "max_h_odds": max_h_odds,
+            "max_d_odds": max_d_odds,
+            "max_a_odds": max_a_odds,
         }
 
     # ── Live prediction ──────────────────────────────────────────────
@@ -312,9 +326,31 @@ class MatchPredictor:
             else:
                 pred_text = "Draw"
 
-            h_odds_val = fix.get("Home_Odds", float("nan"))
-            d_odds_val = fix.get("Draw_Odds", float("nan"))
-            a_odds_val = fix.get("Away_Odds", float("nan"))
+            # Odds — prefer max (best available), fall back to B365
+            max_h = fix.get("Max_Home_Odds", float("nan"))
+            max_d = fix.get("Max_Draw_Odds", float("nan"))
+            max_a = fix.get("Max_Away_Odds", float("nan"))
+            b365_h = fix.get("Home_Odds", float("nan"))
+            b365_d = fix.get("Draw_Odds", float("nan"))
+            b365_a = fix.get("Away_Odds", float("nan"))
+
+            best_h = float(max_h) if pd.notna(max_h) and max_h > 0 else (float(b365_h) if pd.notna(b365_h) else None)
+            best_d = float(max_d) if pd.notna(max_d) and max_d > 0 else (float(b365_d) if pd.notna(b365_d) else None)
+            best_a = float(max_a) if pd.notna(max_a) and max_a > 0 else (float(b365_a) if pd.notna(b365_a) else None)
+
+            # Which odds does our prediction map to?
+            if "Win" in pred_text and pred_text.startswith(home):
+                pred_odds = best_h
+                implied_prob = (1.0 / pred_odds * 100) if pred_odds else None
+            elif "Win" in pred_text:
+                pred_odds = best_a
+                implied_prob = (1.0 / pred_odds * 100) if pred_odds else None
+            elif pred_text == "Draw":
+                pred_odds = best_d
+                implied_prob = (1.0 / pred_odds * 100) if pred_odds else None
+            else:
+                pred_odds = None
+                implied_prob = None
 
             predictions.append({
                 "home_team": home,
@@ -325,9 +361,11 @@ class MatchPredictor:
                 "score_diff": round(float(diff), 2),
                 "home_cat": cat_map.get(home, "D"),
                 "away_cat": cat_map.get(away, "D"),
-                "home_odds": float(h_odds_val) if pd.notna(h_odds_val) else None,
-                "draw_odds": float(d_odds_val) if pd.notna(d_odds_val) else None,
-                "away_odds": float(a_odds_val) if pd.notna(a_odds_val) else None,
+                "home_odds": float(b365_h) if pd.notna(b365_h) else None,
+                "draw_odds": float(b365_d) if pd.notna(b365_d) else None,
+                "away_odds": float(b365_a) if pd.notna(b365_a) else None,
+                "best_odds": pred_odds,
+                "implied_prob": round(implied_prob, 1) if implied_prob else None,
             })
             predicted_teams.add(home)
             predicted_teams.add(away)
@@ -339,7 +377,19 @@ class MatchPredictor:
     def _run_grid(self, prefix_data: dict,
                   threshold_min: int, threshold_max: int,
                   lookback_min: int, lookback_max: int):
-        """Core grid search — vectorized. Returns (accuracy, draw_stats, odds_stats, best, lookback_cache)."""
+        """Core grid search — vectorized.
+
+        Returns (accuracy, draw_stats, odds_stats, roi_stats, best_acc, best_roi, lookback_cache).
+
+        roi_stats[threshold][lookback] = {
+            "stakes": int,        # number of bets placed (= eligible matches)
+            "returns": float,     # total returns at best odds (£1 per bet)
+            "profit": float,      # returns - stakes (unit P&L)
+            "roi_pct": float,     # (profit / stakes) * 100
+            "b365_returns": float, # returns at Bet365 odds only
+            "b365_roi_pct": float, # ROI at Bet365 odds
+        }
+        """
         row_home_n = prefix_data["row_home_n"]
         row_away_n = prefix_data["row_away_n"]
         home_team_ids = prefix_data["home_team_ids"]
@@ -350,15 +400,18 @@ class MatchPredictor:
         h_odds = prefix_data["h_odds"]
         d_odds = prefix_data["d_odds"]
         a_odds = prefix_data["a_odds"]
+        max_h_odds = prefix_data["max_h_odds"]
+        max_d_odds = prefix_data["max_d_odds"]
+        max_a_odds = prefix_data["max_a_odds"]
         N = prefix_data["N"]
 
         accuracy = {}
         draw_stats = {}
         odds_stats = {}
-        lookback_cache = {}  # lb -> (eligible_idx, diffs, elig_actuals, elig_odds)
+        roi_stats = {}
+        lookback_cache = {}
 
         for lookback in range(lookback_min, lookback_max + 1):
-            # Find eligible rows
             eligible_mask = (row_home_n >= lookback) & (row_away_n >= lookback)
             eidx = np.where(eligible_mask)[0]
             n_eligible = len(eidx)
@@ -369,9 +422,13 @@ class MatchPredictor:
                     accuracy.setdefault(threshold, {})[lookback] = 0.0
                     draw_stats.setdefault(threshold, {})[lookback] = {"correct": 0, "predicted": 0}
                     odds_stats.setdefault(threshold, {})[lookback] = {"combined": 0.0, "total": 0, "avg": 0.0}
+                    roi_stats.setdefault(threshold, {})[lookback] = {
+                        "stakes": 0, "returns": 0.0, "profit": 0.0, "roi_pct": 0.0,
+                        "b365_returns": 0.0, "b365_roi_pct": 0.0,
+                    }
                 continue
 
-            # Compute form means using prefix sums — O(n_eligible)
+            # Compute form means using prefix sums
             h_means = np.empty(n_eligible, dtype=np.float64)
             a_means = np.empty(n_eligible, dtype=np.float64)
 
@@ -390,14 +447,22 @@ class MatchPredictor:
 
             diffs = h_means - a_means
             elig_actuals = actuals[eidx]
+
+            # Bet365 odds for eligible matches
             elig_h_odds = h_odds[eidx]
             elig_d_odds = d_odds[eidx]
             elig_a_odds = a_odds[eidx]
 
-            lookback_cache[lookback] = (eidx, diffs, elig_actuals,
-                                        elig_h_odds, elig_d_odds, elig_a_odds)
+            # Best available (max) odds for eligible matches
+            elig_max_h = max_h_odds[eidx]
+            elig_max_d = max_d_odds[eidx]
+            elig_max_a = max_a_odds[eidx]
 
-            # Sweep thresholds — fully vectorized per threshold
+            lookback_cache[lookback] = (eidx, diffs, elig_actuals,
+                                        elig_h_odds, elig_d_odds, elig_a_odds,
+                                        elig_max_h, elig_max_d, elig_max_a)
+
+            # Sweep thresholds
             for threshold in range(threshold_min, threshold_max + 1):
                 predicted = np.where(diffs > threshold, 0,
                             np.where(diffs < -threshold, 2, 1)).astype(np.int32)
@@ -410,13 +475,29 @@ class MatchPredictor:
                 d_correct = int((d_pred_mask & (elig_actuals == 1)).sum())
                 d_predicted = int(d_pred_mask.sum())
 
-                # Odds for correct predictions
-                pred_odds = np.where(predicted == 0, elig_h_odds,
-                            np.where(predicted == 1, elig_d_odds, elig_a_odds))
-                correct_odds = pred_odds[correct_mask]
-                valid_odds = correct_odds[correct_odds > 0]
-                odds_combined = float(valid_odds.sum())
-                correct_with_odds = len(valid_odds)
+                # B365 odds for correct predictions
+                pred_odds_b365 = np.where(predicted == 0, elig_h_odds,
+                                 np.where(predicted == 1, elig_d_odds, elig_a_odds))
+                correct_odds_b365 = pred_odds_b365[correct_mask]
+                valid_b365 = correct_odds_b365[correct_odds_b365 > 0]
+                odds_combined = float(valid_b365.sum())
+                correct_with_odds = len(valid_b365)
+
+                # Best odds for correct predictions (ROI at best price)
+                pred_odds_max = np.where(predicted == 0, elig_max_h,
+                                np.where(predicted == 1, elig_max_d, elig_max_a))
+                correct_odds_max = pred_odds_max[correct_mask]
+                valid_max = correct_odds_max[correct_odds_max > 0]
+
+                # ROI calculation: flat £1 staking
+                # Only count bets that have valid odds (skip matches without odds)
+                has_odds_mask = pred_odds_max > 0
+                stakes_with_odds = int(has_odds_mask.sum())
+                max_returns = float(valid_max.sum())
+                b365_returns = float(valid_b365.sum())
+
+                has_b365_mask = pred_odds_b365 > 0
+                stakes_b365 = int(has_b365_mask.sum())
 
                 acc = (correct_count / total_count * 100) if total_count else 0.0
 
@@ -429,15 +510,30 @@ class MatchPredictor:
                     "total": total_count,
                     "avg": (odds_combined / correct_with_odds) if correct_with_odds else 0.0,
                 }
+                roi_stats.setdefault(threshold, {})[lookback] = {
+                    "stakes": stakes_with_odds,
+                    "returns": round(max_returns, 2),
+                    "profit": round(max_returns - stakes_with_odds, 2),
+                    "roi_pct": round((max_returns - stakes_with_odds) / stakes_with_odds * 100, 2) if stakes_with_odds else 0.0,
+                    "b365_returns": round(b365_returns, 2),
+                    "b365_roi_pct": round((b365_returns - stakes_b365) / stakes_b365 * 100, 2) if stakes_b365 else 0.0,
+                }
 
-        # Find best
-        best = (threshold_min, lookback_min, 0.0)
+        # Find best by accuracy
+        best_acc = (threshold_min, lookback_min, 0.0)
         for t, lb_dict in accuracy.items():
             for lb, acc in lb_dict.items():
-                if acc > best[2]:
-                    best = (t, lb, acc)
+                if acc > best_acc[2]:
+                    best_acc = (t, lb, acc)
 
-        return accuracy, draw_stats, odds_stats, best, lookback_cache
+        # Find best by ROI (minimum 20 bets to avoid flukes)
+        best_roi = (threshold_min, lookback_min, -999.0)
+        for t, lb_dict in roi_stats.items():
+            for lb, rs in lb_dict.items():
+                if rs["stakes"] >= 20 and rs["roi_pct"] > best_roi[2]:
+                    best_roi = (t, lb, rs["roi_pct"])
+
+        return accuracy, draw_stats, odds_stats, roi_stats, best_acc, best_roi, lookback_cache
 
     def backtest(self, results_df: pd.DataFrame,
                  league_table_df: pd.DataFrame,
@@ -445,14 +541,14 @@ class MatchPredictor:
                  lookback_min: int = 3, lookback_max: int = 20) -> dict:
         """Grid search across threshold/lookback combos.
 
-        Returns accuracy grid, draw stats, odds stats, best combo,
+        Returns accuracy grid, draw stats, odds stats, ROI stats, best combos,
         and internal cache for weekly_performance reuse.
         """
         cat_map = infer_categories(league_table_df)
         home_scores, away_scores = self._vectorized_score(results_df, cat_map)
         pd_data = self._build_prefix_data(results_df, home_scores, away_scores)
 
-        accuracy, draw_stats, odds_stats, best, lb_cache = self._run_grid(
+        accuracy, draw_stats, odds_stats, roi_stats, best_acc, best_roi, lb_cache = self._run_grid(
             pd_data, threshold_min, threshold_max, lookback_min, lookback_max,
         )
 
@@ -460,7 +556,9 @@ class MatchPredictor:
             "accuracy": accuracy,
             "draw_stats": draw_stats,
             "odds_stats": odds_stats,
-            "best": best,
+            "roi_stats": roi_stats,
+            "best": best_acc,
+            "best_roi": best_roi,
             "_lb_cache": lb_cache,
             "_n_teams": pd_data["n_teams"],
         }
@@ -473,7 +571,7 @@ class MatchPredictor:
                            lookback_min: int = 3, lookback_max: int = 20,
                            min_week_games: int = 3,
                            backtest_result: dict | None = None) -> list[dict]:
-        """Analyse per-gameweek accuracy. Reuses backtest data if provided."""
+        """Analyse per-gameweek accuracy AND profit. Reuses backtest data if provided."""
         if backtest_result is None:
             backtest_result = self.backtest(
                 results_df, league_table_df,
@@ -496,35 +594,60 @@ class MatchPredictor:
                         "perfect_weeks": 0, "weeks_ge90": 0,
                         "weeks_ge80": 0, "weeks_ge70": 0,
                         "weeks_tested": 0,
+                        "total_profit": 0.0, "total_roi_pct": 0.0,
+                        "best_week_profit": 0.0, "profitable_weeks": 0,
                     })
                 continue
 
-            eidx, diffs, elig_actuals, _, _, _ = cached
+            eidx, diffs, elig_actuals, elig_h_odds, elig_d_odds, elig_a_odds, \
+                elig_max_h, elig_max_d, elig_max_a = cached
 
             for threshold in range(threshold_min, threshold_max + 1):
                 predicted = np.where(diffs > threshold, 0,
                             np.where(diffs < -threshold, 2, 1)).astype(np.int32)
                 correct_mask = (predicted == elig_actuals)
 
+                # Best odds for the predicted outcome
+                pred_max_odds = np.where(predicted == 0, elig_max_h,
+                                np.where(predicted == 1, elig_max_d, elig_max_a))
+
                 n_elig = len(correct_mask)
                 total_correct = int(correct_mask.sum())
                 acc = (total_correct / n_elig * 100) if n_elig else 0.0
 
-                # Group into gameweeks
+                # Overall ROI
+                has_odds = pred_max_odds > 0
+                total_stakes = int(has_odds.sum())
+                total_returns = float((pred_max_odds * correct_mask * has_odds).sum())
+                total_profit = round(total_returns - total_stakes, 2) if total_stakes else 0.0
+                total_roi = round(total_profit / total_stakes * 100, 2) if total_stakes else 0.0
+
+                # Group into gameweeks — track both accuracy and profit
                 week_accs = []
+                week_profits = []
                 for w_start in range(0, n_elig, games_per_week):
                     w_end = min(w_start + games_per_week, n_elig)
-                    w_chunk = correct_mask[w_start:w_end]
-                    if len(w_chunk) < min_week_games:
+                    w_correct = correct_mask[w_start:w_end]
+                    w_odds = pred_max_odds[w_start:w_end]
+                    if len(w_correct) < min_week_games:
                         continue
-                    w_acc = float(w_chunk.sum()) / len(w_chunk) * 100
+                    w_acc = float(w_correct.sum()) / len(w_correct) * 100
                     week_accs.append(w_acc)
 
+                    # Weekly profit: returns - stakes (for matches with odds)
+                    w_has_odds = w_odds > 0
+                    w_stakes = int(w_has_odds.sum())
+                    w_returns = float((w_odds * w_correct * w_has_odds).sum())
+                    week_profits.append(round(w_returns - w_stakes, 2) if w_stakes else 0.0)
+
                 wa = np.array(week_accs) if week_accs else np.array([])
+                wp = np.array(week_profits) if week_profits else np.array([])
                 perfect = int((wa >= 100.0).sum()) if len(wa) else 0
                 ge90 = int((wa >= 90.0).sum()) if len(wa) else 0
                 ge80 = int((wa >= 80.0).sum()) if len(wa) else 0
                 ge70 = int((wa >= 70.0).sum()) if len(wa) else 0
+                profitable_weeks = int((wp > 0).sum()) if len(wp) else 0
+                best_week_profit = round(float(wp.max()), 2) if len(wp) else 0.0
 
                 summary_rows.append({
                     "threshold": threshold, "lookback": lookback,
@@ -532,6 +655,10 @@ class MatchPredictor:
                     "perfect_weeks": perfect, "weeks_ge90": ge90,
                     "weeks_ge80": ge80, "weeks_ge70": ge70,
                     "weeks_tested": len(week_accs),
+                    "total_profit": total_profit,
+                    "total_roi_pct": total_roi,
+                    "best_week_profit": best_week_profit,
+                    "profitable_weeks": profitable_weeks,
                 })
 
         summary_rows.sort(key=lambda r: (

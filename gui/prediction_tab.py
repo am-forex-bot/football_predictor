@@ -1,4 +1,7 @@
-"""Prediction tab — select league, configure params, run predictions."""
+"""Prediction tab — select league, configure params, run predictions.
+
+Shows predictions with odds comparison, implied probability, and potential returns.
+"""
 
 import pandas as pd
 from PyQt6.QtWidgets import (
@@ -59,11 +62,12 @@ class PredictionTab(QWidget):
         results_layout = QVBoxLayout(results_group)
 
         self.results_table = QTableWidget()
-        self.results_table.setColumnCount(10)
-        self.results_table.setHorizontalHeaderLabels([
+        cols = [
             "Home Team", "Cat", "Away Team", "Cat", "Prediction", "Score Diff",
-            "Home Odds", "Draw Odds", "Away Odds", "Predicted Odds",
-        ])
+            "Best Odds", "Implied %", "B365 Odds", "Potential (£10)",
+        ]
+        self.results_table.setColumnCount(len(cols))
+        self.results_table.setHorizontalHeaderLabels(cols)
         self.results_table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.Stretch
         )
@@ -79,7 +83,7 @@ class PredictionTab(QWidget):
 
         # --- Summary ---
         summary_group = QGroupBox("Summary")
-        summary_layout = QHBoxLayout(summary_group)
+        summary_layout = QVBoxLayout(summary_group)
         self.summary_label = QLabel("Run predictions to see results.")
         self.summary_label.setWordWrap(True)
         summary_layout.addWidget(self.summary_label)
@@ -143,7 +147,8 @@ class PredictionTab(QWidget):
         self.results_table.setRowCount(len(predictions))
 
         home_wins = away_wins = draws = no_bets = 0
-        combined_odds = 0.0
+        total_stake = 0.0
+        total_potential = 0.0
 
         for row, p in enumerate(predictions):
             self.results_table.setItem(row, 0, QTableWidgetItem(p["home_team"]))
@@ -156,29 +161,60 @@ class PredictionTab(QWidget):
             diff_item.setData(Qt.ItemDataRole.DisplayRole, p["score_diff"])
             self.results_table.setItem(row, 5, diff_item)
 
-            for col, key in [(6, "home_odds"), (7, "draw_odds"), (8, "away_odds")]:
-                val = p[key]
-                item = QTableWidgetItem(f"{val:.2f}" if val else "-")
-                self.results_table.setItem(row, col, item)
-
+            best_odds = p.get("best_odds")
+            implied = p.get("implied_prob")
             pred_text = p["prediction"]
+
+            # Best available odds for our prediction
+            if best_odds:
+                odds_item = QTableWidgetItem(f"{best_odds:.2f}")
+                odds_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            else:
+                odds_item = QTableWidgetItem("-")
+            self.results_table.setItem(row, 6, odds_item)
+
+            # Implied probability from odds
+            if implied:
+                imp_item = QTableWidgetItem(f"{implied:.1f}%")
+                imp_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                # Higher implied prob = bookies agree = safer bet
+                if implied > 60:
+                    imp_item.setForeground(QColor("#22c55e"))
+                elif implied < 35:
+                    imp_item.setForeground(QColor("#f59e0b"))  # amber for long shots
+            else:
+                imp_item = QTableWidgetItem("-")
+            self.results_table.setItem(row, 7, imp_item)
+
+            # B365 odds for reference
             if "Win" in pred_text and pred_text.startswith(p["home_team"]):
-                pred_odds = p["home_odds"]
+                b365 = p["home_odds"]
                 home_wins += 1
             elif "Win" in pred_text:
-                pred_odds = p["away_odds"]
+                b365 = p["away_odds"]
                 away_wins += 1
             elif pred_text == "No Bet":
-                pred_odds = None
+                b365 = None
                 no_bets += 1
             else:
-                pred_odds = p["draw_odds"]
+                b365 = p["draw_odds"]
                 draws += 1
 
-            odds_str = f"{pred_odds:.2f}" if pred_odds else "-"
-            self.results_table.setItem(row, 9, QTableWidgetItem(odds_str))
-            if pred_odds:
-                combined_odds += pred_odds
+            b365_str = f"{b365:.2f}" if b365 else "-"
+            b365_item = QTableWidgetItem(b365_str)
+            b365_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.results_table.setItem(row, 8, b365_item)
+
+            # Potential return on £10 bet
+            if best_odds and pred_text != "No Bet":
+                potential = best_odds * 10
+                pot_item = QTableWidgetItem(f"£{potential:.2f}")
+                pot_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                total_stake += 10
+                total_potential += potential
+            else:
+                pot_item = QTableWidgetItem("-")
+            self.results_table.setItem(row, 9, pot_item)
 
             # Color code rows
             if "Win" in pred_text and pred_text.startswith(p["home_team"]):
@@ -190,7 +226,7 @@ class PredictionTab(QWidget):
             else:
                 color = QColor("#2a2a2a")
 
-            for col in range(10):
+            for col in range(self.results_table.columnCount()):
                 item = self.results_table.item(row, col)
                 if item:
                     item.setBackground(color)
@@ -198,10 +234,13 @@ class PredictionTab(QWidget):
         self.results_table.setSortingEnabled(True)
 
         actual_preds = home_wins + away_wins + draws
-        avg_odds = combined_odds / actual_preds if actual_preds > 0 else 0
+        avg_odds = total_potential / total_stake if total_stake > 0 else 0
+
         self.summary_label.setText(
             f"Total: {len(predictions)} fixtures  |  "
             f"Home wins: {home_wins}  |  Away wins: {away_wins}  |  "
-            f"Draws: {draws}  |  No bets: {no_bets}  |  "
-            f"Combined odds: {combined_odds:.2f}  |  Avg odds: {avg_odds:.2f}"
+            f"Draws: {draws}  |  No bets: {no_bets}\n"
+            f"If all {actual_preds} bets win at best odds: "
+            f"Stake £{total_stake:.0f} -> Return £{total_potential:.2f} "
+            f"(Profit £{total_potential - total_stake:.2f})"
         )

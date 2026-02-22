@@ -6,15 +6,61 @@ import os
 import pandas as pd
 
 
+def _best_odds(df: pd.DataFrame, suffix: str) -> pd.Series:
+    """Get best available odds for H/D/A across all bookmakers.
+
+    Checks MaxH/MaxD/MaxA first (football-data.co.uk pre-computed max),
+    then falls back to computing max across known bookmaker columns,
+    then falls back to B365 alone.
+    """
+    max_col = f"Max{suffix}"  # e.g. MaxH, MaxD, MaxA
+    if max_col in df.columns:
+        return pd.to_numeric(df[max_col], errors="coerce")
+
+    # Known bookmaker prefixes on football-data.co.uk
+    prefixes = ["B365", "BW", "IW", "PS", "WH", "VC", "LB", "SB"]
+    available = []
+    for pfx in prefixes:
+        col = f"{pfx}{suffix}"
+        if col in df.columns:
+            available.append(pd.to_numeric(df[col], errors="coerce"))
+
+    if available:
+        return pd.concat(available, axis=1).max(axis=1)
+
+    return pd.Series(float("nan"), index=df.index)
+
+
+def _avg_odds(df: pd.DataFrame, suffix: str) -> pd.Series:
+    """Get market average odds. Uses AvgH/D/A if available, else mean of bookmakers."""
+    avg_col = f"Avg{suffix}"
+    if avg_col in df.columns:
+        return pd.to_numeric(df[avg_col], errors="coerce")
+
+    prefixes = ["B365", "BW", "IW", "PS", "WH", "VC"]
+    available = []
+    for pfx in prefixes:
+        col = f"{pfx}{suffix}"
+        if col in df.columns:
+            available.append(pd.to_numeric(df[col], errors="coerce"))
+
+    if available:
+        return pd.concat(available, axis=1).mean(axis=1)
+
+    return pd.Series(float("nan"), index=df.index)
+
+
 def clean_results(raw_df: pd.DataFrame) -> pd.DataFrame:
     """Extract and rename the columns we need from the raw CSV.
 
     Returns only completed matches (FTR is not NaN).
-    Columns: Team, Opponent, GF, GA, Result, Home_Odds, Draw_Odds, Away_Odds
+    Columns: Team, Opponent, GF, GA, Result,
+             Home_Odds, Draw_Odds, Away_Odds (Bet365),
+             Max_Home_Odds, Max_Draw_Odds, Max_Away_Odds (best price),
+             Avg_Home_Odds, Avg_Draw_Odds, Avg_Away_Odds (market average),
+             Pin_Home_Odds, Pin_Draw_Odds, Pin_Away_Odds (Pinnacle)
     """
-    # Use column names rather than positional indices for robustness
     required = ["HomeTeam", "AwayTeam", "FTHG", "FTAG", "FTR"]
-    odds_cols = ["B365H", "B365D", "B365A"]
 
     for col in required:
         if col not in raw_df.columns:
@@ -32,8 +78,23 @@ def clean_results(raw_df: pd.DataFrame) -> pd.DataFrame:
     # H → W (home team won), A → L (home team lost), D stays
     result["Result"] = df["FTR"].replace({"H": "W", "A": "L"})
 
-    # Odds — may be missing in some rows
-    for src, dst in zip(odds_cols, ["Home_Odds", "Draw_Odds", "Away_Odds"]):
+    # Bet365 odds (primary — always present on football-data.co.uk)
+    for src, dst in [("B365H", "Home_Odds"), ("B365D", "Draw_Odds"), ("B365A", "Away_Odds")]:
+        if src in df.columns:
+            result[dst] = pd.to_numeric(df[src], errors="coerce")
+        else:
+            result[dst] = float("nan")
+
+    # Best available odds across all bookmakers (what a real punter shops for)
+    for suffix, dst in [("H", "Max_Home_Odds"), ("D", "Max_Draw_Odds"), ("A", "Max_Away_Odds")]:
+        result[dst] = _best_odds(df, suffix).values
+
+    # Market average odds
+    for suffix, dst in [("H", "Avg_Home_Odds"), ("D", "Avg_Draw_Odds"), ("A", "Avg_Away_Odds")]:
+        result[dst] = _avg_odds(df, suffix).values
+
+    # Pinnacle odds (sharpest line — best for implied probability)
+    for src, dst in [("PSH", "Pin_Home_Odds"), ("PSD", "Pin_Draw_Odds"), ("PSA", "Pin_Away_Odds")]:
         if src in df.columns:
             result[dst] = pd.to_numeric(df[src], errors="coerce")
         else:
@@ -74,9 +135,18 @@ def extract_fixtures(raw_df: pd.DataFrame) -> pd.DataFrame:
     result["Team"] = df[home_col].values
     result["Opponent"] = df[away_col].values
 
+    # Bet365 odds
     for src, dst in [("B365H", "Home_Odds"), ("B365D", "Draw_Odds"), ("B365A", "Away_Odds")]:
         if src in df.columns:
             result[dst] = pd.to_numeric(df[src].values, errors="coerce")
+
+    # Best available odds
+    for suffix, dst in [("H", "Max_Home_Odds"), ("D", "Max_Draw_Odds"), ("A", "Max_Away_Odds")]:
+        result[dst] = _best_odds(df, suffix).values
+
+    # Market average odds
+    for suffix, dst in [("H", "Avg_Home_Odds"), ("D", "Avg_Draw_Odds"), ("A", "Avg_Away_Odds")]:
+        result[dst] = _avg_odds(df, suffix).values
 
     return result.reset_index(drop=True)
 
