@@ -64,7 +64,7 @@ class PredictionTab(QWidget):
         self.results_table = QTableWidget()
         cols = [
             "Home Team", "Cat", "Away Team", "Cat", "Prediction", "Score Diff",
-            "Best Odds", "Implied %", "B365 Odds", "Potential (£10)",
+            "B365 Odds", "Implied %", "Potential (£10)", "Acca Leg",
         ]
         self.results_table.setColumnCount(len(cols))
         self.results_table.setHorizontalHeaderLabels(cols)
@@ -147,8 +147,8 @@ class PredictionTab(QWidget):
         self.results_table.setRowCount(len(predictions))
 
         home_wins = away_wins = draws = no_bets = 0
-        total_stake = 0.0
-        total_potential = 0.0
+        acca_odds = 1.0
+        acca_legs = 0
 
         for row, p in enumerate(predictions):
             self.results_table.setItem(row, 0, QTableWidgetItem(p["home_team"]))
@@ -161,60 +161,59 @@ class PredictionTab(QWidget):
             diff_item.setData(Qt.ItemDataRole.DisplayRole, p["score_diff"])
             self.results_table.setItem(row, 5, diff_item)
 
-            best_odds = p.get("best_odds")
+            pred_odds = p.get("pred_odds")
             implied = p.get("implied_prob")
             pred_text = p["prediction"]
 
-            # Best available odds for our prediction
-            if best_odds:
-                odds_item = QTableWidgetItem(f"{best_odds:.2f}")
+            # B365 odds for our prediction
+            if pred_odds:
+                odds_item = QTableWidgetItem(f"{pred_odds:.2f}")
                 odds_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             else:
                 odds_item = QTableWidgetItem("-")
             self.results_table.setItem(row, 6, odds_item)
 
-            # Implied probability from odds
+            # Implied probability from B365 odds
             if implied:
                 imp_item = QTableWidgetItem(f"{implied:.1f}%")
                 imp_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                # Higher implied prob = bookies agree = safer bet
                 if implied > 60:
                     imp_item.setForeground(QColor("#22c55e"))
                 elif implied < 35:
-                    imp_item.setForeground(QColor("#f59e0b"))  # amber for long shots
+                    imp_item.setForeground(QColor("#f59e0b"))
             else:
                 imp_item = QTableWidgetItem("-")
             self.results_table.setItem(row, 7, imp_item)
 
-            # B365 odds for reference
+            # Track wins/draws/no bets
             if "Win" in pred_text and pred_text.startswith(p["home_team"]):
-                b365 = p["home_odds"]
                 home_wins += 1
             elif "Win" in pred_text:
-                b365 = p["away_odds"]
                 away_wins += 1
             elif pred_text == "No Bet":
-                b365 = None
                 no_bets += 1
             else:
-                b365 = p["draw_odds"]
                 draws += 1
 
-            b365_str = f"{b365:.2f}" if b365 else "-"
-            b365_item = QTableWidgetItem(b365_str)
-            b365_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.results_table.setItem(row, 8, b365_item)
-
             # Potential return on £10 bet
-            if best_odds and pred_text != "No Bet":
-                potential = best_odds * 10
+            if pred_odds and pred_text != "No Bet":
+                potential = pred_odds * 10
                 pot_item = QTableWidgetItem(f"£{potential:.2f}")
                 pot_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                total_stake += 10
-                total_potential += potential
+                acca_odds *= pred_odds
+                acca_legs += 1
             else:
                 pot_item = QTableWidgetItem("-")
-            self.results_table.setItem(row, 9, pot_item)
+            self.results_table.setItem(row, 8, pot_item)
+
+            # Acca running odds
+            if pred_odds and pred_text != "No Bet":
+                acca_item = QTableWidgetItem(f"{pred_odds:.2f}")
+                acca_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                acca_item.setForeground(QColor("#fbbf24"))
+            else:
+                acca_item = QTableWidgetItem("-")
+            self.results_table.setItem(row, 9, acca_item)
 
             # Color code rows
             if "Win" in pred_text and pred_text.startswith(p["home_team"]):
@@ -234,13 +233,12 @@ class PredictionTab(QWidget):
         self.results_table.setSortingEnabled(True)
 
         actual_preds = home_wins + away_wins + draws
-        avg_odds = total_potential / total_stake if total_stake > 0 else 0
+        acca_return = acca_odds * 5 if acca_legs > 0 else 0
 
         self.summary_label.setText(
             f"Total: {len(predictions)} fixtures  |  "
-            f"Home wins: {home_wins}  |  Away wins: {away_wins}  |  "
+            f"Home: {home_wins}  |  Away: {away_wins}  |  "
             f"Draws: {draws}  |  No bets: {no_bets}\n"
-            f"If all {actual_preds} bets win at best odds: "
-            f"Stake £{total_stake:.0f} -> Return £{total_potential:.2f} "
-            f"(Profit £{total_potential - total_stake:.2f})"
+            f"Accumulator ({acca_legs} legs): odds = {acca_odds:.1f}  |  "
+            f"£5 acca returns £{acca_return:,.2f} if all correct"
         )

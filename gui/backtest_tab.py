@@ -1,7 +1,10 @@
-"""Backtest tab — historical accuracy AND profitability testing.
+"""Backtest tab — historical accuracy, ROI, and accumulator analysis.
 
-Grids across threshold/lookback showing accuracy heatmap AND ROI heatmap.
-Weekly performance tracks both accuracy and profit per gameweek.
+All profit/ROI uses Bet365 odds. Tracks:
+- Accuracy grid across threshold/lookback
+- ROI grid (flat £1 staking at B365)
+- Weekly performance with accumulator tracking
+- Per-week detail view for any combo (double-click a row)
 """
 
 from PyQt6.QtWidgets import (
@@ -53,12 +56,46 @@ class _BacktestWorker(QObject):
             self.error.emit(str(exc))
 
 
+class _DetailWorker(QObject):
+    """Get per-week detail for a specific combo."""
+    finished = pyqtSignal(list)
+    error = pyqtSignal(str)
+
+    def __init__(self, results_df, table_df, threshold, lookback, min_week_games,
+                 backtest_result):
+        super().__init__()
+        self.results_df = results_df
+        self.table_df = table_df
+        self.threshold = threshold
+        self.lookback = lookback
+        self.min_week_games = min_week_games
+        self.backtest_result = backtest_result
+
+    def run(self):
+        try:
+            predictor = MatchPredictor(PredictorConfig())
+            detail = predictor.weekly_detail(
+                self.results_df, self.table_df,
+                self.threshold, self.lookback,
+                min_week_games=self.min_week_games,
+                backtest_result=self.backtest_result,
+            )
+            self.finished.emit(detail)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
 class BacktestTab(QWidget):
     def __init__(self, main_window):
         super().__init__()
         self.main_window = main_window
         self._thread = None
         self._worker = None
+        self._detail_thread = None
+        self._detail_worker = None
+        self._last_result = None
+        self._last_results_df = None
+        self._last_table_df = None
         self._init_ui()
 
     def _init_ui(self):
@@ -113,7 +150,7 @@ class BacktestTab(QWidget):
         # --- Sub-tabs for results ---
         self.result_tabs = QTabWidget()
 
-        # 1. Accuracy grid tab
+        # 1. Accuracy grid
         grid_widget = QWidget()
         grid_layout = QVBoxLayout(grid_widget)
         self.grid_table = QTableWidget()
@@ -125,7 +162,7 @@ class BacktestTab(QWidget):
         grid_layout.addWidget(self.best_label)
         self.result_tabs.addTab(grid_widget, "Accuracy Grid")
 
-        # 2. ROI grid tab (the money maker)
+        # 2. ROI grid (B365, flat staking)
         roi_widget = QWidget()
         roi_layout = QVBoxLayout(roi_widget)
         self.roi_table = QTableWidget()
@@ -135,20 +172,40 @@ class BacktestTab(QWidget):
         self.roi_label = QLabel("")
         self.roi_label.setProperty("heading", True)
         roi_layout.addWidget(self.roi_label)
-        self.result_tabs.addTab(roi_widget, "ROI Grid (Profit)")
+        self.result_tabs.addTab(roi_widget, "B365 ROI Grid")
 
-        # 3. Weekly performance tab
+        # 3. Weekly performance + acca tracking
         weekly_widget = QWidget()
         weekly_layout = QVBoxLayout(weekly_widget)
+        weekly_hint = QLabel("Double-click any row to see week-by-week breakdown")
+        weekly_hint.setStyleSheet("color: #888; font-style: italic;")
+        weekly_layout.addWidget(weekly_hint)
         self.weekly_table = QTableWidget()
         self.weekly_table.setAlternatingRowColors(True)
         self.weekly_table.setSortingEnabled(True)
         self.weekly_table.verticalHeader().setVisible(False)
+        self.weekly_table.doubleClicked.connect(self._on_weekly_double_click)
         weekly_layout.addWidget(self.weekly_table)
         self.weekly_label = QLabel("")
         self.weekly_label.setProperty("heading", True)
         weekly_layout.addWidget(self.weekly_label)
-        self.result_tabs.addTab(weekly_widget, "Weekly Performance")
+        self.result_tabs.addTab(weekly_widget, "Weekly + Accas")
+
+        # 4. Week-by-week detail (populated on double-click)
+        detail_widget = QWidget()
+        detail_layout = QVBoxLayout(detail_widget)
+        self.detail_header = QLabel("Double-click a row in Weekly tab to load detail")
+        self.detail_header.setProperty("heading", True)
+        detail_layout.addWidget(self.detail_header)
+        self.detail_table = QTableWidget()
+        self.detail_table.setAlternatingRowColors(True)
+        self.detail_table.setSortingEnabled(False)
+        self.detail_table.verticalHeader().setVisible(False)
+        detail_layout.addWidget(self.detail_table)
+        self.detail_summary = QLabel("")
+        self.detail_summary.setWordWrap(True)
+        detail_layout.addWidget(self.detail_summary)
+        self.result_tabs.addTab(detail_widget, "Week Detail")
 
         layout.addWidget(self.result_tabs)
 
@@ -182,6 +239,9 @@ class BacktestTab(QWidget):
             return
 
         results_df, _, table_df = data
+        self._last_results_df = results_df
+        self._last_table_df = table_df
+
         t_min = self.t_min_spin.value()
         t_max = self.t_max_spin.value()
         lb_min = self.lb_min_spin.value()
@@ -204,6 +264,7 @@ class BacktestTab(QWidget):
 
     def _on_finished(self, result: dict):
         self.run_btn.setEnabled(True)
+        self._last_result = result
         accuracy = result["accuracy"]
         draw_stats = result["draw_stats"]
         odds_stats = result["odds_stats"]
@@ -215,22 +276,18 @@ class BacktestTab(QWidget):
         thresholds = sorted(accuracy.keys())
         lookbacks = sorted({lb for t in accuracy.values() for lb in t})
 
-        # === ACCURACY GRID ===
         self._fill_accuracy_grid(thresholds, lookbacks, accuracy, best)
-
-        # === ROI GRID ===
         self._fill_roi_grid(thresholds, lookbacks, roi_stats, best_roi)
-
-        # === WEEKLY PERFORMANCE ===
         self._fill_weekly_table(weekly)
-
-        # === DETAILED STATS ===
-        self._fill_stats(thresholds, lookbacks, accuracy, draw_stats, odds_stats, roi_stats, weekly)
+        self._fill_stats(thresholds, lookbacks, accuracy, draw_stats, odds_stats,
+                         roi_stats, weekly)
 
         self.main_window.set_status(
             f"Backtest complete. Best accuracy: T={best[0]} LB={best[1]} -> {best[2]:.1f}% | "
-            f"Best ROI: T={best_roi[0]} LB={best_roi[1]} -> {best_roi[2]:+.1f}%"
+            f"Best ROI (B365): T={best_roi[0]} LB={best_roi[1]} -> {best_roi[2]:+.1f}%"
         )
+
+    # ── Accuracy Grid ─────────────────────────────────────────────────
 
     def _fill_accuracy_grid(self, thresholds, lookbacks, accuracy, best):
         self.grid_table.setRowCount(len(thresholds))
@@ -274,20 +331,13 @@ class BacktestTab(QWidget):
             f"Best: Threshold={best[0]}, Lookback={best[1]}, Accuracy={best[2]:.1f}%"
         )
 
+    # ── ROI Grid (B365) ──────────────────────────────────────────────
+
     def _fill_roi_grid(self, thresholds, lookbacks, roi_stats, best_roi):
         self.roi_table.setRowCount(len(thresholds))
         self.roi_table.setColumnCount(len(lookbacks))
         self.roi_table.setHorizontalHeaderLabels([f"LB {lb}" for lb in lookbacks])
         self.roi_table.setVerticalHeaderLabels([f"T={t}" for t in thresholds])
-
-        all_roi = []
-        for t in thresholds:
-            for lb in lookbacks:
-                rs = roi_stats.get(t, {}).get(lb, {})
-                all_roi.append(rs.get("roi_pct", 0.0))
-
-        min_roi = min(all_roi) if all_roi else -100
-        max_roi = max(all_roi) if all_roi else 100
 
         for r, t in enumerate(thresholds):
             for c, lb in enumerate(lookbacks):
@@ -296,7 +346,6 @@ class BacktestTab(QWidget):
                 profit = rs.get("profit", 0.0)
                 stakes = rs.get("stakes", 0)
 
-                # Show ROI% and profit in units
                 if stakes > 0:
                     text = f"{roi_pct:+.1f}%"
                 else:
@@ -305,15 +354,14 @@ class BacktestTab(QWidget):
                 item = QTableWidgetItem(text)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 item.setToolTip(
-                    f"ROI: {roi_pct:+.1f}%\n"
+                    f"B365 ROI: {roi_pct:+.1f}%\n"
                     f"Profit: {profit:+.1f} units\n"
-                    f"Bets: {stakes}\n"
-                    f"Returns: {rs.get('returns', 0):.1f}"
+                    f"Bets placed: {stakes}\n"
+                    f"Returns: £{rs.get('returns', 0):.2f}"
                 )
 
-                # Color: green for profit, red for loss
                 if roi_pct > 0:
-                    intensity = min(roi_pct / 30.0, 1.0)  # saturate at +30%
+                    intensity = min(roi_pct / 30.0, 1.0)
                     item.setBackground(QColor(40, int(80 + 120 * intensity), 40, 120))
                     item.setForeground(QColor("#22c55e"))
                 elif roi_pct < 0:
@@ -333,61 +381,74 @@ class BacktestTab(QWidget):
 
         if best_roi[2] > -999:
             self.roi_label.setText(
-                f"Best ROI: Threshold={best_roi[0]}, Lookback={best_roi[1]}, "
-                f"ROI={best_roi[2]:+.1f}% (flat £1 staking, best available odds)"
+                f"Best ROI: T={best_roi[0]}, LB={best_roi[1]}, "
+                f"ROI={best_roi[2]:+.1f}% (flat £1 staking, Bet365 odds)"
             )
         else:
-            self.roi_label.setText("No combos with enough bets (need 20+) to calculate ROI")
+            self.roi_label.setText("No combos with 20+ bets to calculate ROI")
+
+    # ── Weekly + Acca Table ───────────────────────────────────────────
 
     def _fill_weekly_table(self, weekly):
-        weekly_cols = [
-            "Threshold", "Lookback", "Accuracy%", "Games",
-            "Perfect Weeks", "90%+", "80%+", "70%+",
-            "Weeks Tested", "Total P&L", "ROI%",
-            "Best Week", "Profit Weeks",
+        cols = [
+            "T", "LB", "Acc%", "Games", "100%", "90%+", "80%+",
+            "Weeks", "Flat P&L", "Flat ROI%",
+            "Acca P&L (£5)", "Best Acca",
+            "Profit Wks",
         ]
         self.weekly_table.setSortingEnabled(False)
-        self.weekly_table.setColumnCount(len(weekly_cols))
-        self.weekly_table.setHorizontalHeaderLabels(weekly_cols)
+        self.weekly_table.setColumnCount(len(cols))
+        self.weekly_table.setHorizontalHeaderLabels(cols)
         self.weekly_table.setRowCount(len(weekly))
 
         for r, w in enumerate(weekly):
-            profit = w.get("total_profit", 0.0)
-            roi = w.get("total_roi_pct", 0.0)
+            flat_pnl = w.get("flat_profit", 0.0)
+            flat_roi = w.get("flat_roi_pct", 0.0)
+            acca_pnl = w.get("acca_profit", 0.0)
+            acca_best = w.get("acca_best_payout", 0.0)
 
-            items_data = [
-                (str(w["threshold"]), None, None),
-                (str(w["lookback"]), None, None),
-                (f"{w['accuracy']:.1f}%", None, None),
-                (str(w["total_games"]), None, None),
-                (str(w["perfect_weeks"]),
-                 QColor("#22c55e") if w["perfect_weeks"] > 0 else None, None),
-                (str(w["weeks_ge90"]),
-                 QColor("#16a34a") if w["weeks_ge90"] > 0 else None, None),
-                (str(w["weeks_ge80"]), None, None),
-                (str(w["weeks_ge70"]), None, None),
-                (str(w["weeks_tested"]), None, None),
-                (f"{profit:+.1f}",
-                 QColor("#22c55e") if profit > 0 else QColor("#ef4444") if profit < 0 else None,
-                 None),
-                (f"{roi:+.1f}%",
-                 QColor("#22c55e") if roi > 0 else QColor("#ef4444") if roi < 0 else None,
-                 None),
-                (f"{w.get('best_week_profit', 0):+.1f}", None, None),
-                (str(w.get("profitable_weeks", 0)), None, None),
+            items = [
+                str(w["threshold"]),
+                str(w["lookback"]),
+                f"{w['accuracy']:.1f}",
+                str(w["total_games"]),
+                str(w["perfect_weeks"]),
+                str(w["weeks_ge90"]),
+                str(w["weeks_ge80"]),
+                str(w["weeks_tested"]),
+                f"{flat_pnl:+.1f}",
+                f"{flat_roi:+.1f}",
+                f"{acca_pnl:+.1f}",
+                f"£{acca_best:.0f}" if acca_best > 0 else "-",
+                str(w.get("profitable_weeks", 0)),
             ]
 
-            for c, (text, fg_color, bg_color) in enumerate(items_data):
+            for c, text in enumerate(items):
                 item = QTableWidgetItem(text)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if fg_color:
-                    item.setForeground(fg_color)
-                # Highlight rows with perfect weeks
-                if w["perfect_weeks"] > 0:
+
+                # Color specific columns
+                if c == 4 and w["perfect_weeks"] > 0:  # 100% weeks
+                    item.setForeground(QColor("#fbbf24"))  # gold
+                if c == 8:  # Flat P&L
+                    item.setForeground(QColor("#22c55e") if flat_pnl > 0
+                                       else QColor("#ef4444") if flat_pnl < 0
+                                       else QColor("#888"))
+                if c == 10:  # Acca P&L
+                    item.setForeground(QColor("#22c55e") if acca_pnl > 0
+                                       else QColor("#ef4444") if acca_pnl < 0
+                                       else QColor("#888"))
+                if c == 11 and acca_best > 0:  # Best acca payout
+                    item.setForeground(QColor("#fbbf24"))
+
+                # Row background
+                if w["perfect_weeks"] > 0 and acca_pnl > 0:
+                    item.setBackground(QColor("#2a2a10"))  # gold tint — the goldmine
+                elif w["perfect_weeks"] > 0:
                     item.setBackground(QColor("#1a3a2a"))
-                # Highlight profitable rows
-                elif profit > 0:
+                elif flat_pnl > 0:
                     item.setBackground(QColor("#1a2a1a"))
+
                 self.weekly_table.setItem(r, c, item)
 
         self.weekly_table.setSortingEnabled(True)
@@ -396,24 +457,161 @@ class BacktestTab(QWidget):
         )
 
         if weekly:
-            # Find most profitable combo
-            best_profit = max(weekly, key=lambda w: w.get("total_profit", 0))
+            # Find combos with perfect weeks AND positive acca P&L
+            goldmine = [w for w in weekly if w["perfect_weeks"] > 0 and w.get("acca_profit", 0) > 0]
             top = weekly[0]
-            self.weekly_label.setText(
-                f"Top accuracy combo: T={top['threshold']} LB={top['lookback']} — "
-                f"{top['perfect_weeks']} perfect weeks, {top['accuracy']:.1f}% overall | "
-                f"Most profitable: T={best_profit['threshold']} LB={best_profit['lookback']} — "
-                f"{best_profit.get('total_profit', 0):+.1f} units"
-            )
+            if goldmine:
+                g = max(goldmine, key=lambda w: w["acca_profit"])
+                self.weekly_label.setText(
+                    f"GOLDMINE: T={g['threshold']} LB={g['lookback']} — "
+                    f"{g['perfect_weeks']} perfect weeks, "
+                    f"acca P&L £{g['acca_profit']:+.0f} (best payout £{g.get('acca_best_payout', 0):.0f}) | "
+                    f"Flat: {g.get('flat_profit', 0):+.1f}u, {g['accuracy']:.1f}% acc"
+                )
+            elif top["perfect_weeks"] > 0:
+                self.weekly_label.setText(
+                    f"Top: T={top['threshold']} LB={top['lookback']} — "
+                    f"{top['perfect_weeks']} perfect weeks, {top['accuracy']:.1f}% overall"
+                )
+            else:
+                self.weekly_label.setText(
+                    f"No perfect weeks found. Top accuracy: T={top['threshold']} "
+                    f"LB={top['lookback']} -> {top['accuracy']:.1f}%"
+                )
         else:
             self.weekly_label.setText("No weekly data generated")
 
-    def _fill_stats(self, thresholds, lookbacks, accuracy, draw_stats, odds_stats, roi_stats, weekly):
+    # ── Double-click: Week-by-week Detail ─────────────────────────────
+
+    def _on_weekly_double_click(self, index):
+        row = index.row()
+        t_item = self.weekly_table.item(row, 0)
+        lb_item = self.weekly_table.item(row, 1)
+        if not t_item or not lb_item:
+            return
+
+        threshold = int(t_item.text())
+        lookback = int(lb_item.text())
+
+        if self._last_results_df is None or self._last_result is None:
+            return
+
+        self.main_window.set_status(f"Loading week detail for T={threshold} LB={lookback}...")
+
+        self._detail_thread = QThread()
+        self._detail_worker = _DetailWorker(
+            self._last_results_df, self._last_table_df,
+            threshold, lookback, self.min_week_spin.value(),
+            self._last_result,
+        )
+        self._detail_worker.moveToThread(self._detail_thread)
+        self._detail_thread.started.connect(self._detail_worker.run)
+        self._detail_worker.finished.connect(
+            lambda detail: self._on_detail_finished(detail, threshold, lookback)
+        )
+        self._detail_worker.error.connect(self._on_error)
+        self._detail_worker.finished.connect(self._detail_thread.quit)
+        self._detail_worker.error.connect(self._detail_thread.quit)
+        self._detail_thread.start()
+
+    def _on_detail_finished(self, detail: list, threshold: int, lookback: int):
+        self.detail_header.setText(
+            f"Week-by-Week Detail — Threshold={threshold}, Lookback={lookback} "
+            f"(Bet365 odds, £5 weekly acca)"
+        )
+
+        cols = [
+            "Week", "Games", "Correct", "Acc%",
+            "Flat P&L", "Acca Odds", "Acca Won?", "Acca Payout",
+            "Cum. Flat", "Cum. Acca",
+        ]
+        self.detail_table.setColumnCount(len(cols))
+        self.detail_table.setHorizontalHeaderLabels(cols)
+        self.detail_table.setRowCount(len(detail))
+
+        for r, w in enumerate(detail):
+            items = [
+                str(w["week"]),
+                str(w["games"]),
+                str(w["correct"]),
+                f"{w['accuracy']:.0f}%",
+                f"{w['flat_profit']:+.1f}",
+                f"{w['acca_odds']:.1f}" if w["acca_odds"] < 100000 else f"{w['acca_odds']:.0f}",
+                "YES" if w["acca_won"] else "",
+                f"£{w['acca_payout']:.0f}" if w["acca_won"] else "-£5",
+                f"{w['cumulative_flat']:+.1f}",
+                f"{w['cumulative_acca']:+.1f}",
+            ]
+
+            for c, text in enumerate(items):
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+                # 100% week — the goldmine
+                if w["accuracy"] >= 100:
+                    item.setBackground(QColor("#3a3a10"))
+                    if c == 6:  # Acca Won
+                        item.setForeground(QColor("#fbbf24"))
+                    elif c == 7:  # Payout
+                        item.setForeground(QColor("#22c55e"))
+                elif w["accuracy"] >= 90:
+                    item.setBackground(QColor("#1a3a2a"))
+                elif w["accuracy"] < 50:
+                    item.setBackground(QColor("#2a1a1a"))
+
+                # Color P&L columns
+                if c in (4, 8):  # flat P&L, cumulative flat
+                    val = w["flat_profit"] if c == 4 else w["cumulative_flat"]
+                    item.setForeground(QColor("#22c55e") if val > 0
+                                       else QColor("#ef4444") if val < 0
+                                       else QColor("#888"))
+                if c == 9:  # cumulative acca
+                    val = w["cumulative_acca"]
+                    item.setForeground(QColor("#22c55e") if val > 0
+                                       else QColor("#ef4444") if val < 0
+                                       else QColor("#888"))
+
+                self.detail_table.setItem(r, c, item)
+
+        self.detail_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+
+        # Summary
+        if detail:
+            total_weeks = len(detail)
+            perfect = sum(1 for w in detail if w["accuracy"] >= 100)
+            final_flat = detail[-1]["cumulative_flat"]
+            final_acca = detail[-1]["cumulative_acca"]
+            acca_wins = [w for w in detail if w["acca_won"]]
+            biggest = max((w["acca_payout"] for w in acca_wins), default=0)
+
+            self.detail_summary.setText(
+                f"Season summary: {total_weeks} weeks | "
+                f"{perfect} perfect (100%) weeks | "
+                f"Flat staking P&L: {final_flat:+.1f} units | "
+                f"Acca P&L (£5/wk): £{final_acca:+.1f} | "
+                f"Acca wins: {len(acca_wins)} | "
+                f"Biggest payout: £{biggest:.0f}"
+            )
+        else:
+            self.detail_summary.setText("No week data available")
+
+        # Switch to detail tab
+        self.result_tabs.setCurrentIndex(3)
+        self.main_window.set_status(
+            f"Week detail loaded for T={threshold} LB={lookback}"
+        )
+
+    # ── Stats ─────────────────────────────────────────────────────────
+
+    def _fill_stats(self, thresholds, lookbacks, accuracy, draw_stats,
+                    odds_stats, roi_stats, weekly):
         lines = []
-        lines.append("=" * 90)
+        lines.append("=" * 95)
         lines.append(f"{'T':>3} {'LB':>3} | {'Acc%':>6} | {'Draws':>12} | "
-                     f"{'Avg Odds':>8} | {'ROI%':>7} | {'Profit':>8} | {'Bets':>5}")
-        lines.append("=" * 90)
+                     f"{'Avg Odds':>8} | {'B365 ROI':>8} | {'Profit':>8} | {'Bets':>5}")
+        lines.append("=" * 95)
 
         for t in thresholds:
             for lb in lookbacks:
@@ -426,39 +624,52 @@ class BacktestTab(QWidget):
                 profit = rs.get("profit", 0.0)
                 stakes = rs.get("stakes", 0)
 
-                profit_marker = "+++" if roi > 10 else "++" if roi > 5 else "+" if roi > 0 else ""
+                marker = "+++" if roi > 10 else "++" if roi > 5 else "+" if roi > 0 else ""
 
                 lines.append(
                     f"T={t:2d} LB={lb:2d} | {acc:5.1f}% | "
                     f"{ds['correct']:3d}/{ds['predicted']:3d} ({draw_acc:4.0f}%) | "
                     f"{os_data.get('avg', 0):7.2f} | "
-                    f"{roi:+6.1f}% | {profit:+7.1f}u | {stakes:4d} {profit_marker}"
+                    f"{roi:+7.1f}% | {profit:+7.1f}u | {stakes:4d} {marker}"
                 )
 
-        # Separator and summary
-        lines.append("=" * 90)
+        lines.append("=" * 95)
 
-        # Find profitable combos
+        # Profitable combos
         profitable = []
         for t in thresholds:
             for lb in lookbacks:
                 rs = roi_stats.get(t, {}).get(lb, {})
                 if rs.get("roi_pct", 0) > 0 and rs.get("stakes", 0) >= 20:
                     profitable.append((t, lb, rs["roi_pct"], rs["profit"], rs["stakes"]))
-
         profitable.sort(key=lambda x: x[2], reverse=True)
 
         if profitable:
-            lines.append(f"\nPROFITABLE COMBOS (min 20 bets, best odds):")
+            lines.append(f"\nPROFITABLE AT BET365 (min 20 bets, flat £1 staking):")
             for t, lb, roi, profit, stakes in profitable[:10]:
                 acc = accuracy.get(t, {}).get(lb, 0)
                 lines.append(
                     f"  T={t:2d} LB={lb:2d} | Acc: {acc:.1f}% | "
-                    f"ROI: {roi:+.1f}% | Profit: {profit:+.1f}u over {stakes} bets"
+                    f"ROI: {roi:+.1f}% | Profit: £{profit:+.1f} over {stakes} bets"
                 )
-        else:
-            lines.append("\nNo profitable combos found (with 20+ bets). "
-                         "Try expanding the grid range or downloading more seasons.")
+
+        # Goldmine combos (perfect weeks with acca profit)
+        goldmine = [w for w in weekly if w["perfect_weeks"] > 0 and w.get("acca_profit", 0) > 0]
+        if goldmine:
+            goldmine.sort(key=lambda w: w["acca_profit"], reverse=True)
+            lines.append(f"\nGOLDMINE COMBOS (perfect weeks + acca profit at £5/wk):")
+            for g in goldmine[:5]:
+                lines.append(
+                    f"  T={g['threshold']:2d} LB={g['lookback']:2d} | "
+                    f"{g['perfect_weeks']} perfect weeks | "
+                    f"Acca P&L: £{g['acca_profit']:+.0f} | "
+                    f"Best payout: £{g.get('acca_best_payout', 0):.0f} | "
+                    f"Flat: {g.get('flat_profit', 0):+.1f}u | "
+                    f"Acc: {g['accuracy']:.1f}%"
+                )
+
+        if not profitable and not goldmine:
+            lines.append("\nNo profitable combos found. Try different ranges or more data.")
 
         self.stats_text.setPlainText("\n".join(lines))
 
