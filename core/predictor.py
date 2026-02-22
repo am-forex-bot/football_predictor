@@ -770,6 +770,213 @@ class MatchPredictor:
 
         return all_weeks
 
+    # ── Walk-Forward Analysis ─────────────────────────────────────
+
+    def walk_forward_analysis(self, multi_bt: dict) -> dict:
+        """Walk-forward optimization using pre-computed per-season backtests.
+
+        For each test season and each training window size:
+        - Find the best combo on the training seasons
+        - Test that combo on the out-of-sample test season
+        - Record both in-sample and out-of-sample performance
+
+        This answers: "Which training window gives the best predictions?
+        And what combo should I use for the current season?"
+
+        Uses already-computed _per_season data — no re-computation needed.
+        """
+        from core.leagues import season_display
+
+        per_season = multi_bt["_per_season"]
+        seasons = multi_bt["seasons"]
+        n = len(seasons)
+
+        if n < 3:
+            return {"error": "Need at least 3 seasons for walk-forward analysis"}
+
+        # Get threshold/lookback ranges from the first season's backtest
+        first_bt = per_season[seasons[0]]["bt"]
+        thresholds = sorted(first_bt["accuracy"].keys())
+        all_lookbacks = sorted(first_bt["accuracy"][thresholds[0]].keys())
+
+        # Training window sizes to test
+        window_sizes = [1, 2, 3]
+        if n >= 6:
+            window_sizes.append(5)
+        if n >= 9:
+            window_sizes.append(n - 1)
+
+        # ── Run walk-forward for each window size ──────────────────
+        wf_results = {}  # ws -> list of per-test-season results
+
+        for ws in window_sizes:
+            wf_results[ws] = []
+
+            for test_idx in range(ws, n):
+                test_season = seasons[test_idx]
+                train_seasons = seasons[test_idx - ws:test_idx]
+
+                # Find best combo on training data (by accuracy)
+                best_acc_combo = None
+                best_train_acc = 0.0
+                best_roi_combo = None
+                best_train_roi = -999.0
+                best_train_roi_stakes = 0
+
+                for t in thresholds:
+                    for lb in all_lookbacks:
+                        total_correct = 0
+                        total_eligible = 0
+                        total_stakes = 0
+                        total_returns = 0.0
+
+                        for ts in train_seasons:
+                            bt = per_season[ts]["bt"]
+                            n_elig = bt["odds_stats"].get(t, {}).get(lb, {}).get("total", 0)
+                            acc = bt["accuracy"].get(t, {}).get(lb, 0.0)
+                            total_correct += round(acc / 100 * n_elig) if n_elig > 0 else 0
+                            total_eligible += n_elig
+
+                            rs = bt["roi_stats"].get(t, {}).get(lb, {})
+                            total_stakes += rs.get("stakes", 0)
+                            total_returns += rs.get("returns", 0.0)
+
+                        train_acc = (total_correct / total_eligible * 100) if total_eligible else 0
+                        train_roi = ((total_returns - total_stakes) / total_stakes * 100
+                                     if total_stakes >= 20 else -999)
+
+                        if train_acc > best_train_acc:
+                            best_train_acc = train_acc
+                            best_acc_combo = (t, lb)
+
+                        if train_roi > best_train_roi and total_stakes >= 20:
+                            best_train_roi = train_roi
+                            best_roi_combo = (t, lb)
+                            best_train_roi_stakes = total_stakes
+
+                if best_acc_combo is None:
+                    continue
+
+                # Test best-by-accuracy combo on out-of-sample season
+                test_bt = per_season[test_season]["bt"]
+                test_acc = test_bt["accuracy"].get(best_acc_combo[0], {}).get(best_acc_combo[1], 0.0)
+                test_roi_data = test_bt["roi_stats"].get(best_acc_combo[0], {}).get(best_acc_combo[1], {})
+                test_roi = test_roi_data.get("roi_pct", 0.0)
+                test_stakes = test_roi_data.get("stakes", 0)
+                test_profit = test_roi_data.get("profit", 0.0)
+
+                # Also test best-by-ROI combo (if different)
+                roi_test_acc = 0.0
+                roi_test_roi = 0.0
+                roi_test_profit = 0.0
+                if best_roi_combo and best_roi_combo != best_acc_combo:
+                    roi_test_acc = test_bt["accuracy"].get(best_roi_combo[0], {}).get(best_roi_combo[1], 0.0)
+                    roi_rd = test_bt["roi_stats"].get(best_roi_combo[0], {}).get(best_roi_combo[1], {})
+                    roi_test_roi = roi_rd.get("roi_pct", 0.0)
+                    roi_test_profit = roi_rd.get("profit", 0.0)
+
+                wf_results[ws].append({
+                    "test_season": test_season,
+                    "test_display": season_display(test_season),
+                    "train_seasons": [season_display(s) for s in train_seasons],
+                    # Best by accuracy
+                    "best_combo": best_acc_combo,
+                    "train_acc": round(best_train_acc, 1),
+                    "test_acc": round(test_acc, 1),
+                    "test_roi": round(test_roi, 1),
+                    "test_profit": round(test_profit, 1),
+                    "test_stakes": test_stakes,
+                    # Best by ROI
+                    "roi_combo": best_roi_combo,
+                    "train_roi": round(best_train_roi, 1) if best_train_roi > -999 else None,
+                    "roi_test_acc": round(roi_test_acc, 1),
+                    "roi_test_roi": round(roi_test_roi, 1),
+                    "roi_test_profit": round(roi_test_profit, 1),
+                })
+
+        # ── Summarize each window size ─────────────────────────────
+        summary = {}
+        for ws, res_list in wf_results.items():
+            if not res_list:
+                continue
+            avg_test_acc = sum(r["test_acc"] for r in res_list) / len(res_list)
+            avg_test_roi = sum(r["test_roi"] for r in res_list) / len(res_list)
+            avg_test_profit = sum(r["test_profit"] for r in res_list) / len(res_list)
+
+            # Combo frequency — how often is the same combo selected?
+            combo_counts = defaultdict(int)
+            for r in res_list:
+                combo_counts[r["best_combo"]] += 1
+            most_common = sorted(combo_counts.items(), key=lambda x: x[1], reverse=True)
+
+            summary[ws] = {
+                "avg_test_acc": round(avg_test_acc, 1),
+                "avg_test_roi": round(avg_test_roi, 1),
+                "avg_test_profit": round(avg_test_profit, 1),
+                "n_tests": len(res_list),
+                "combo_frequency": most_common,
+                "detail": res_list,
+            }
+
+        # ── Find optimal window size ───────────────────────────────
+        if not summary:
+            return {"error": "Insufficient data for walk-forward analysis"}
+
+        # Best by OOS accuracy
+        best_ws_acc = max(summary.keys(), key=lambda ws: summary[ws]["avg_test_acc"])
+        # Best by OOS ROI
+        best_ws_roi = max(summary.keys(), key=lambda ws: summary[ws]["avg_test_roi"])
+
+        # ── Current recommendation ─────────────────────────────────
+        # Use the best window to pick the combo for the current/latest season
+        recommendations = {}
+        for label, best_ws in [("accuracy", best_ws_acc), ("roi", best_ws_roi)]:
+            train_seasons = seasons[-best_ws:] if best_ws <= n else seasons
+            best_t, best_lb, best_val = None, None, -999.0
+
+            for t in thresholds:
+                for lb in all_lookbacks:
+                    total_correct = 0
+                    total_eligible = 0
+                    total_stakes = 0
+                    total_returns = 0.0
+
+                    for ts in train_seasons:
+                        bt = per_season[ts]["bt"]
+                        n_elig = bt["odds_stats"].get(t, {}).get(lb, {}).get("total", 0)
+                        acc = bt["accuracy"].get(t, {}).get(lb, 0.0)
+                        total_correct += round(acc / 100 * n_elig) if n_elig > 0 else 0
+                        total_eligible += n_elig
+                        rs = bt["roi_stats"].get(t, {}).get(lb, {})
+                        total_stakes += rs.get("stakes", 0)
+                        total_returns += rs.get("returns", 0.0)
+
+                    if label == "accuracy":
+                        val = (total_correct / total_eligible * 100) if total_eligible else 0
+                    else:
+                        val = ((total_returns - total_stakes) / total_stakes * 100
+                               if total_stakes >= 20 else -999)
+
+                    if val > best_val:
+                        best_val = val
+                        best_t, best_lb = t, lb
+
+            recommendations[label] = {
+                "window_size": best_ws,
+                "train_seasons": [season_display(s) for s in train_seasons],
+                "combo": (best_t, best_lb),
+                "train_value": round(best_val, 1),
+            }
+
+        return {
+            "window_results": wf_results,
+            "summary": summary,
+            "best_ws_acc": best_ws_acc,
+            "best_ws_roi": best_ws_roi,
+            "recommendations": recommendations,
+            "seasons": seasons,
+        }
+
     # ── Weekly performance ───────────────────────────────────────────
 
     def weekly_performance(self, results_df: pd.DataFrame,

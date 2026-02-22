@@ -52,6 +52,9 @@ class _BacktestWorker(QObject):
                     self.t_min, self.t_max, self.lb_min, self.lb_max,
                     min_week_games=self.min_week_games,
                 )
+                # Walk-forward analysis (fast — reuses per-season data)
+                wf = predictor.walk_forward_analysis(result)
+                result["walk_forward"] = wf
             else:
                 result = predictor.backtest(
                     self.results_df, self.table_df,
@@ -229,6 +232,17 @@ class BacktestTab(QWidget):
         detail_layout.addWidget(self.detail_summary)
         self.result_tabs.addTab(detail_widget, "Week Detail")
 
+        # 5. Walk-forward analysis (multi-season only)
+        wf_widget = QWidget()
+        wf_layout = QVBoxLayout(wf_widget)
+        self.wf_text = QTextEdit()
+        self.wf_text.setReadOnly(True)
+        self.wf_text.setPlainText("Run a multi-season backtest to see walk-forward analysis.\n"
+                                  "This tests whether combos that worked in the past\n"
+                                  "actually predict the next season out-of-sample.")
+        wf_layout.addWidget(self.wf_text)
+        self.result_tabs.addTab(wf_widget, "Walk Forward")
+
         layout.addWidget(self.result_tabs)
 
         # --- Stats ---
@@ -315,6 +329,7 @@ class BacktestTab(QWidget):
         self._fill_weekly_table(weekly)
         self._fill_stats(thresholds, lookbacks, accuracy, draw_stats, odds_stats,
                          roi_stats, weekly, result=result)
+        self._fill_walk_forward(result)
 
         # Count matches and seasons
         n_matches = 0
@@ -671,6 +686,129 @@ class BacktestTab(QWidget):
         self.main_window.set_status(
             f"Week detail loaded for T={threshold} LB={lookback}"
         )
+
+    # ── Walk-Forward ──────────────────────────────────────────────────
+
+    def _fill_walk_forward(self, result: dict):
+        wf = result.get("walk_forward")
+        if not wf or "error" in wf:
+            msg = wf.get("error", "Not available") if wf else "Single-season data — need 3+ seasons"
+            self.wf_text.setPlainText(
+                f"Walk-Forward Analysis: {msg}\n\n"
+                "Download 3+ seasons and run a multi-season backtest to enable this."
+            )
+            return
+
+        from core.leagues import season_display
+
+        summary = wf["summary"]
+        recs = wf["recommendations"]
+        lines = []
+
+        # ── Headline recommendation ────────────────────────────────
+        lines.append("=" * 90)
+        lines.append("WALK-FORWARD ANALYSIS — Which training window predicts best?")
+        lines.append("=" * 90)
+        lines.append("")
+
+        best_ws_acc = wf["best_ws_acc"]
+        best_ws_roi = wf["best_ws_roi"]
+        s_acc = summary[best_ws_acc]
+        s_roi = summary[best_ws_roi]
+
+        lines.append(f"BEST WINDOW (by out-of-sample accuracy): {best_ws_acc} season(s)")
+        lines.append(f"  Avg OOS accuracy: {s_acc['avg_test_acc']:.1f}% "
+                     f"| Avg OOS ROI: {s_acc['avg_test_roi']:+.1f}% "
+                     f"| Tested on {s_acc['n_tests']} seasons")
+
+        if best_ws_roi != best_ws_acc:
+            lines.append(f"BEST WINDOW (by out-of-sample ROI): {best_ws_roi} season(s)")
+            lines.append(f"  Avg OOS accuracy: {s_roi['avg_test_acc']:.1f}% "
+                         f"| Avg OOS ROI: {s_roi['avg_test_roi']:+.1f}% "
+                         f"| Tested on {s_roi['n_tests']} seasons")
+
+        lines.append("")
+
+        # ── Current recommendation ─────────────────────────────────
+        lines.append("-" * 90)
+        lines.append("RECOMMENDATION FOR CURRENT SEASON:")
+        lines.append("-" * 90)
+
+        for label, display in [("accuracy", "Best Accuracy"), ("roi", "Best ROI")]:
+            rec = recs.get(label)
+            if not rec:
+                continue
+            t, lb = rec["combo"]
+            lines.append(
+                f"  By {display}: T={t}, LB={lb} "
+                f"(trained on {', '.join(rec['train_seasons'])} "
+                f"-> {rec['train_value']:+.1f}%)"
+            )
+
+        lines.append("")
+
+        # ── Window comparison table ────────────────────────────────
+        lines.append("-" * 90)
+        lines.append(f"{'Window':>8} | {'OOS Acc':>8} | {'OOS ROI':>8} | {'Tests':>5} | "
+                     f"{'Most Common Combo':>20} | {'Stability':>10}")
+        lines.append("-" * 90)
+
+        for ws in sorted(summary.keys()):
+            s = summary[ws]
+            top_combo = s["combo_frequency"][0] if s["combo_frequency"] else ((0, 0), 0)
+            combo_str = f"T={top_combo[0][0]} LB={top_combo[0][1]}"
+            freq = f"{top_combo[1]}/{s['n_tests']}"
+
+            marker = " <-- BEST" if ws == best_ws_acc else ""
+            lines.append(
+                f"{ws:>5} yr | {s['avg_test_acc']:>7.1f}% | {s['avg_test_roi']:>+7.1f}% | "
+                f"{s['n_tests']:>5} | {combo_str:>20} | {freq:>10}{marker}"
+            )
+
+        lines.append("")
+
+        # ── Detailed walk-forward per window ───────────────────────
+        for ws in sorted(summary.keys()):
+            s = summary[ws]
+            lines.append("=" * 90)
+            label = f"{ws} season" if ws == 1 else f"{ws} seasons"
+            lines.append(f"WINDOW: Train on last {label}")
+            lines.append("-" * 90)
+            lines.append(
+                f"  {'Test Season':>12} | {'Trained On':>30} | {'Best Combo':>12} | "
+                f"{'Train':>6} | {'Test':>6} | {'ROI':>7} | {'Profit':>7}"
+            )
+            lines.append("  " + "-" * 86)
+
+            for r in s["detail"]:
+                t, lb = r["best_combo"]
+                train_str = ", ".join(r["train_seasons"])
+                if len(train_str) > 28:
+                    train_str = train_str[:25] + "..."
+                lines.append(
+                    f"  {r['test_display']:>12} | {train_str:>30} | "
+                    f"T={t:2d} LB={lb:2d} | "
+                    f"{r['train_acc']:5.1f}% | {r['test_acc']:5.1f}% | "
+                    f"{r['test_roi']:+6.1f}% | {r['test_profit']:+6.1f}u"
+                )
+
+            lines.append(
+                f"\n  Average OOS: {s['avg_test_acc']:.1f}% accuracy, "
+                f"{s['avg_test_roi']:+.1f}% ROI, "
+                f"{s['avg_test_profit']:+.1f}u profit per season"
+            )
+
+            # Combo stability
+            if s["combo_frequency"]:
+                lines.append(f"\n  Combo frequency (how stable is the 'best' combo?):")
+                for (t, lb), count in s["combo_frequency"][:5]:
+                    pct = count / s["n_tests"] * 100
+                    bar = "#" * int(pct / 5)
+                    lines.append(f"    T={t:2d} LB={lb:2d}: {count}/{s['n_tests']} ({pct:.0f}%) {bar}")
+
+            lines.append("")
+
+        self.wf_text.setPlainText("\n".join(lines))
 
     # ── Stats ─────────────────────────────────────────────────────────
 
