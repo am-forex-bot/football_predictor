@@ -498,53 +498,17 @@ class MatchPredictor:
 
         return accuracy, draw_stats, odds_stats, roi_stats, best_acc, best_roi, lookback_cache
 
-    def _score_multi_season(self, results_df: pd.DataFrame) -> tuple:
-        """Score multi-season data using per-season category maps.
-
-        Each season's matches are scored using that season's league table,
-        so team categories reflect their actual standing at the time.
-        Form (prefix sums) carries across season boundaries.
-        """
-        from core.cleaner import build_league_table
-
-        if "Season" not in results_df.columns:
-            raise ValueError("Multi-season data requires a 'Season' column")
-
-        seasons = results_df["Season"].unique()
-        all_home_scores = np.empty(len(results_df), dtype=np.float64)
-        all_away_scores = np.empty(len(results_df), dtype=np.float64)
-
-        for season in seasons:
-            mask = results_df["Season"] == season
-            season_df = results_df[mask]
-            # Build league table from this season's matches → categories for this season
-            season_table = build_league_table(season_df)
-            cat_map = infer_categories(season_table)
-            h_scores, a_scores = self._vectorized_score(season_df, cat_map)
-            indices = np.where(mask)[0]
-            all_home_scores[indices] = h_scores
-            all_away_scores[indices] = a_scores
-
-        return all_home_scores, all_away_scores
-
     def backtest(self, results_df: pd.DataFrame,
                  league_table_df: pd.DataFrame,
                  threshold_min: int = 1, threshold_max: int = 20,
                  lookback_min: int = 3, lookback_max: int = 20) -> dict:
-        """Grid search across threshold/lookback combos.
-
-        Handles both single-season and multi-season data. If results_df has a
-        'Season' column, builds per-season category maps for correct scoring.
-        Form carries across season boundaries.
+        """Grid search across threshold/lookback combos for a SINGLE season.
 
         Returns accuracy grid, draw stats, odds stats, ROI stats, best combos,
         and internal cache for weekly_performance reuse.
         """
-        if "Season" in results_df.columns and results_df["Season"].nunique() > 1:
-            home_scores, away_scores = self._score_multi_season(results_df)
-        else:
-            cat_map = infer_categories(league_table_df)
-            home_scores, away_scores = self._vectorized_score(results_df, cat_map)
+        cat_map = infer_categories(league_table_df)
+        home_scores, away_scores = self._vectorized_score(results_df, cat_map)
 
         pd_data = self._build_prefix_data(results_df, home_scores, away_scores)
 
@@ -562,6 +526,249 @@ class MatchPredictor:
             "_lb_cache": lb_cache,
             "_n_teams": pd_data["n_teams"],
         }
+
+    def backtest_multi_season(self, results_df: pd.DataFrame,
+                               threshold_min: int = 1, threshold_max: int = 20,
+                               lookback_min: int = 3, lookback_max: int = 20) -> dict:
+        """Run INDEPENDENT backtests per season and aggregate results.
+
+        Lookback never straddles season boundaries — each season starts fresh.
+        Categories are rebuilt per season from that season's standings.
+        Accuracy, ROI, perfect weeks are cumulated across all seasons.
+        Per-season results also stored for breakdown.
+        """
+        from core.cleaner import build_league_table
+
+        if "Season" not in results_df.columns:
+            raise ValueError("Multi-season data requires a 'Season' column")
+
+        seasons = sorted(results_df["Season"].unique())
+        per_season = {}
+
+        for season in seasons:
+            season_df = results_df[results_df["Season"] == season].reset_index(drop=True)
+            season_table = build_league_table(season_df)
+            bt = self.backtest(season_df, season_table,
+                               threshold_min, threshold_max,
+                               lookback_min, lookback_max)
+            per_season[season] = {
+                "results_df": season_df,
+                "table_df": season_table,
+                "bt": bt,
+            }
+
+        # ── Aggregate across seasons ──────────────────────────────────
+        agg_accuracy = {}
+        agg_draw_stats = {}
+        agg_odds_stats = {}
+        agg_roi_stats = {}
+
+        for t in range(threshold_min, threshold_max + 1):
+            for lb in range(lookback_min, lookback_max + 1):
+                total_correct = 0
+                total_eligible = 0
+                total_d_correct = 0
+                total_d_predicted = 0
+                total_odds_combined = 0.0
+                total_correct_with_odds = 0
+                total_stakes = 0
+                total_returns = 0.0
+
+                for season in seasons:
+                    bt = per_season[season]["bt"]
+                    n = bt["odds_stats"].get(t, {}).get(lb, {}).get("total", 0)
+                    acc = bt["accuracy"].get(t, {}).get(lb, 0.0)
+                    correct = round(acc / 100 * n) if n > 0 else 0
+
+                    total_correct += correct
+                    total_eligible += n
+
+                    ds = bt["draw_stats"].get(t, {}).get(lb, {})
+                    total_d_correct += ds.get("correct", 0)
+                    total_d_predicted += ds.get("predicted", 0)
+
+                    os_data = bt["odds_stats"].get(t, {}).get(lb, {})
+                    total_odds_combined += os_data.get("combined", 0.0)
+                    avg_o = os_data.get("avg", 0.0)
+                    if avg_o > 0 and os_data.get("combined", 0) > 0:
+                        total_correct_with_odds += round(os_data["combined"] / avg_o)
+
+                    rs = bt["roi_stats"].get(t, {}).get(lb, {})
+                    total_stakes += rs.get("stakes", 0)
+                    total_returns += rs.get("returns", 0.0)
+
+                agg_acc = (total_correct / total_eligible * 100) if total_eligible else 0.0
+                agg_accuracy.setdefault(t, {})[lb] = round(agg_acc, 2)
+
+                agg_draw_stats.setdefault(t, {})[lb] = {
+                    "correct": total_d_correct,
+                    "predicted": total_d_predicted,
+                }
+
+                agg_odds_stats.setdefault(t, {})[lb] = {
+                    "combined": round(total_odds_combined, 2),
+                    "total": total_eligible,
+                    "avg": round(total_odds_combined / total_correct_with_odds, 2)
+                           if total_correct_with_odds else 0.0,
+                }
+
+                profit = round(total_returns - total_stakes, 2)
+                agg_roi_stats.setdefault(t, {})[lb] = {
+                    "stakes": total_stakes,
+                    "returns": round(total_returns, 2),
+                    "profit": profit,
+                    "roi_pct": round(profit / total_stakes * 100, 2) if total_stakes else 0.0,
+                }
+
+        # Best aggregate accuracy
+        best_acc = (threshold_min, lookback_min, 0.0)
+        for t, lb_dict in agg_accuracy.items():
+            for lb, acc in lb_dict.items():
+                if acc > best_acc[2]:
+                    best_acc = (t, lb, acc)
+
+        # Best aggregate ROI (higher minimum stakes across multi-season)
+        min_stakes = max(50, len(seasons) * 20)
+        best_roi = (threshold_min, lookback_min, -999.0)
+        for t, lb_dict in agg_roi_stats.items():
+            for lb, rs in lb_dict.items():
+                if rs["stakes"] >= min_stakes and rs["roi_pct"] > best_roi[2]:
+                    best_roi = (t, lb, rs["roi_pct"])
+
+        return {
+            "accuracy": agg_accuracy,
+            "draw_stats": agg_draw_stats,
+            "odds_stats": agg_odds_stats,
+            "roi_stats": agg_roi_stats,
+            "best": best_acc,
+            "best_roi": best_roi,
+            "_per_season": per_season,
+            "_n_teams": per_season[seasons[-1]]["bt"]["_n_teams"],
+            "_multi_season": True,
+            "n_seasons": len(seasons),
+            "seasons": seasons,
+        }
+
+    def weekly_performance_multi(self, multi_bt: dict,
+                                  threshold_min: int = 1, threshold_max: int = 20,
+                                  lookback_min: int = 3, lookback_max: int = 20,
+                                  min_week_games: int = 3,
+                                  acca_stake: float = 5.0) -> list[dict]:
+        """Aggregate weekly performance across multiple independent seasons."""
+        per_season = multi_bt["_per_season"]
+        seasons = multi_bt["seasons"]
+
+        # Run weekly_performance per season
+        per_season_rows = {}
+        for season in seasons:
+            sc = per_season[season]
+            weekly = self.weekly_performance(
+                sc["results_df"], sc["table_df"],
+                threshold_min, threshold_max,
+                lookback_min, lookback_max,
+                min_week_games=min_week_games,
+                acca_stake=acca_stake,
+                backtest_result=sc["bt"],
+            )
+            per_season_rows[season] = {
+                (r["threshold"], r["lookback"]): r for r in weekly
+            }
+
+        # Aggregate
+        summary_rows = []
+        for t in range(threshold_min, threshold_max + 1):
+            for lb in range(lookback_min, lookback_max + 1):
+                total_games = 0
+                total_correct_est = 0
+                total_perfect = 0
+                total_ge90 = 0
+                total_ge80 = 0
+                total_ge70 = 0
+                total_weeks = 0
+                total_flat_profit = 0.0
+                total_acca_profit = 0.0
+                best_acca_payout = 0.0
+                total_profitable_weeks = 0
+
+                for season in seasons:
+                    r = per_season_rows[season].get((t, lb))
+                    if r is None:
+                        continue
+                    total_games += r["total_games"]
+                    if r["total_games"] > 0:
+                        total_correct_est += round(r["accuracy"] / 100 * r["total_games"])
+                    total_perfect += r["perfect_weeks"]
+                    total_ge90 += r["weeks_ge90"]
+                    total_ge80 += r["weeks_ge80"]
+                    total_ge70 += r["weeks_ge70"]
+                    total_weeks += r["weeks_tested"]
+                    total_flat_profit += r["flat_profit"]
+                    total_acca_profit += r["acca_profit"]
+                    best_acca_payout = max(best_acca_payout, r["acca_best_payout"])
+                    total_profitable_weeks += r["profitable_weeks"]
+
+                agg_acc = (total_correct_est / total_games * 100) if total_games else 0.0
+                flat_roi = (total_flat_profit / total_games * 100) if total_games else 0.0
+
+                summary_rows.append({
+                    "threshold": t, "lookback": lb,
+                    "total_games": total_games,
+                    "accuracy": round(agg_acc, 2),
+                    "perfect_weeks": total_perfect,
+                    "weeks_ge90": total_ge90,
+                    "weeks_ge80": total_ge80,
+                    "weeks_ge70": total_ge70,
+                    "weeks_tested": total_weeks,
+                    "flat_profit": round(total_flat_profit, 2),
+                    "flat_roi_pct": round(flat_roi, 2),
+                    "acca_profit": round(total_acca_profit, 2),
+                    "acca_best_payout": round(best_acca_payout, 2),
+                    "profitable_weeks": total_profitable_weeks,
+                })
+
+        summary_rows.sort(key=lambda r: (
+            r["perfect_weeks"], r["weeks_ge90"], r["weeks_ge80"],
+            r["accuracy"], r["total_games"],
+        ), reverse=True)
+
+        return summary_rows
+
+    def weekly_detail_multi(self, multi_bt: dict,
+                             threshold: int, lookback: int,
+                             min_week_games: int = 3,
+                             acca_stake: float = 5.0) -> list[dict]:
+        """Per-week breakdown across multiple seasons with running cumulatives."""
+        from core.leagues import season_display
+
+        per_season = multi_bt["_per_season"]
+        seasons = multi_bt["seasons"]
+
+        all_weeks = []
+        cum_flat = 0.0
+        cum_acca = 0.0
+
+        for season in seasons:
+            sc = per_season[season]
+            weeks = self.weekly_detail(
+                sc["results_df"], sc["table_df"],
+                threshold, lookback,
+                min_week_games=min_week_games,
+                acca_stake=acca_stake,
+                backtest_result=sc["bt"],
+            )
+            for w in weeks:
+                cum_flat += w["flat_profit"]
+                acca_pnl = w["acca_payout"] - acca_stake
+                cum_acca += acca_pnl
+                all_weeks.append({
+                    **w,
+                    "season": season_display(season),
+                    "week": len(all_weeks) + 1,
+                    "cumulative_flat": round(cum_flat, 2),
+                    "cumulative_acca": round(cum_acca, 2),
+                })
+
+        return all_weeks
 
     # ── Weekly performance ───────────────────────────────────────────
 

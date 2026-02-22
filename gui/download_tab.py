@@ -48,7 +48,7 @@ class DownloadTab(QWidget):
         select_layout.addWidget(QLabel("Seasons:"))
         self.seasons_spin = QSpinBox()
         self.seasons_spin.setRange(1, 10)
-        self.seasons_spin.setValue(5)
+        self.seasons_spin.setValue(8)
         self.seasons_spin.setToolTip(
             "Number of seasons to download.\n"
             "More seasons = more thorough backtest.\n"

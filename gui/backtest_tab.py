@@ -38,17 +38,31 @@ class _BacktestWorker(QObject):
         try:
             predictor = MatchPredictor(PredictorConfig())
 
-            result = predictor.backtest(
-                self.results_df, self.table_df,
-                self.t_min, self.t_max, self.lb_min, self.lb_max,
-            )
+            is_multi = ("Season" in self.results_df.columns and
+                        self.results_df["Season"].nunique() > 1)
 
-            weekly = predictor.weekly_performance(
-                self.results_df, self.table_df,
-                self.t_min, self.t_max, self.lb_min, self.lb_max,
-                min_week_games=self.min_week_games,
-                backtest_result=result,
-            )
+            if is_multi:
+                # Per-season independent backtests, aggregated results
+                result = predictor.backtest_multi_season(
+                    self.results_df,
+                    self.t_min, self.t_max, self.lb_min, self.lb_max,
+                )
+                weekly = predictor.weekly_performance_multi(
+                    result,
+                    self.t_min, self.t_max, self.lb_min, self.lb_max,
+                    min_week_games=self.min_week_games,
+                )
+            else:
+                result = predictor.backtest(
+                    self.results_df, self.table_df,
+                    self.t_min, self.t_max, self.lb_min, self.lb_max,
+                )
+                weekly = predictor.weekly_performance(
+                    self.results_df, self.table_df,
+                    self.t_min, self.t_max, self.lb_min, self.lb_max,
+                    min_week_games=self.min_week_games,
+                    backtest_result=result,
+                )
 
             result["weekly"] = weekly
             self.finished.emit(result)
@@ -74,12 +88,20 @@ class _DetailWorker(QObject):
     def run(self):
         try:
             predictor = MatchPredictor(PredictorConfig())
-            detail = predictor.weekly_detail(
-                self.results_df, self.table_df,
-                self.threshold, self.lookback,
-                min_week_games=self.min_week_games,
-                backtest_result=self.backtest_result,
-            )
+
+            if self.backtest_result.get("_multi_season"):
+                detail = predictor.weekly_detail_multi(
+                    self.backtest_result,
+                    self.threshold, self.lookback,
+                    min_week_games=self.min_week_games,
+                )
+            else:
+                detail = predictor.weekly_detail(
+                    self.results_df, self.table_df,
+                    self.threshold, self.lookback,
+                    min_week_games=self.min_week_games,
+                    backtest_result=self.backtest_result,
+                )
             self.finished.emit(detail)
         except Exception as exc:
             self.error.emit(str(exc))
@@ -292,7 +314,7 @@ class BacktestTab(QWidget):
         self._fill_roi_grid(thresholds, lookbacks, roi_stats, best_roi)
         self._fill_weekly_table(weekly)
         self._fill_stats(thresholds, lookbacks, accuracy, draw_stats, odds_stats,
-                         roi_stats, weekly)
+                         roi_stats, weekly, result=result)
 
         # Count matches and seasons
         n_matches = 0
@@ -536,22 +558,40 @@ class BacktestTab(QWidget):
         self._detail_thread.start()
 
     def _on_detail_finished(self, detail: list, threshold: int, lookback: int):
+        is_multi = detail and "season" in detail[0]
+
+        n_seasons_txt = ""
+        if is_multi:
+            seasons_in_detail = sorted(set(w["season"] for w in detail))
+            n_seasons_txt = f" across {len(seasons_in_detail)} seasons"
+
         self.detail_header.setText(
-            f"Week-by-Week Detail — Threshold={threshold}, Lookback={lookback} "
+            f"Week-by-Week Detail — T={threshold}, LB={lookback}{n_seasons_txt} "
             f"(Bet365 odds, £5 weekly acca)"
         )
 
-        cols = [
-            "Week", "Games", "Correct", "Acc%",
-            "Flat P&L", "Acca Odds", "Acca Won?", "Acca Payout",
-            "Cum. Flat", "Cum. Acca",
-        ]
+        if is_multi:
+            cols = [
+                "Season", "Week", "Games", "Correct", "Acc%",
+                "Flat P&L", "Acca Odds", "Acca Won?", "Acca Payout",
+                "Cum. Flat", "Cum. Acca",
+            ]
+        else:
+            cols = [
+                "Week", "Games", "Correct", "Acc%",
+                "Flat P&L", "Acca Odds", "Acca Won?", "Acca Payout",
+                "Cum. Flat", "Cum. Acca",
+            ]
+
         self.detail_table.setColumnCount(len(cols))
         self.detail_table.setHorizontalHeaderLabels(cols)
         self.detail_table.setRowCount(len(detail))
 
         for r, w in enumerate(detail):
-            items = [
+            items = []
+            if is_multi:
+                items.append(w["season"])
+            items += [
                 str(w["week"]),
                 str(w["games"]),
                 str(w["correct"]),
@@ -564,6 +604,9 @@ class BacktestTab(QWidget):
                 f"{w['cumulative_acca']:+.1f}",
             ]
 
+            # Column offset for P&L coloring
+            off = 1 if is_multi else 0
+
             for c, text in enumerate(items):
                 item = QTableWidgetItem(text)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -571,9 +614,9 @@ class BacktestTab(QWidget):
                 # 100% week — the goldmine
                 if w["accuracy"] >= 100:
                     item.setBackground(QColor("#3a3a10"))
-                    if c == 6:  # Acca Won
+                    if c == 6 + off:  # Acca Won
                         item.setForeground(QColor("#fbbf24"))
-                    elif c == 7:  # Payout
+                    elif c == 7 + off:  # Payout
                         item.setForeground(QColor("#22c55e"))
                 elif w["accuracy"] >= 90:
                     item.setBackground(QColor("#1a3a2a"))
@@ -581,12 +624,12 @@ class BacktestTab(QWidget):
                     item.setBackground(QColor("#2a1a1a"))
 
                 # Color P&L columns
-                if c in (4, 8):  # flat P&L, cumulative flat
-                    val = w["flat_profit"] if c == 4 else w["cumulative_flat"]
+                if c in (4 + off, 8 + off):  # flat P&L, cumulative flat
+                    val = w["flat_profit"] if c == 4 + off else w["cumulative_flat"]
                     item.setForeground(QColor("#22c55e") if val > 0
                                        else QColor("#ef4444") if val < 0
                                        else QColor("#888"))
-                if c == 9:  # cumulative acca
+                if c == 9 + off:  # cumulative acca
                     val = w["cumulative_acca"]
                     item.setForeground(QColor("#22c55e") if val > 0
                                        else QColor("#ef4444") if val < 0
@@ -607,14 +650,19 @@ class BacktestTab(QWidget):
             acca_wins = [w for w in detail if w["acca_won"]]
             biggest = max((w["acca_payout"] for w in acca_wins), default=0)
 
-            self.detail_summary.setText(
-                f"Season summary: {total_weeks} weeks | "
-                f"{perfect} perfect (100%) weeks | "
-                f"Flat staking P&L: {final_flat:+.1f} units | "
-                f"Acca P&L (£5/wk): £{final_acca:+.1f} | "
-                f"Acca wins: {len(acca_wins)} | "
-                f"Biggest payout: £{biggest:.0f}"
-            )
+            summary_parts = []
+            if is_multi:
+                summary_parts.append(f"{len(seasons_in_detail)} seasons, {total_weeks} weeks")
+            else:
+                summary_parts.append(f"{total_weeks} weeks")
+            summary_parts += [
+                f"{perfect} perfect (100%) weeks",
+                f"Flat P&L: {final_flat:+.1f} units",
+                f"Acca P&L (£5/wk): £{final_acca:+.1f}",
+                f"Acca wins: {len(acca_wins)}",
+                f"Biggest payout: £{biggest:.0f}",
+            ]
+            self.detail_summary.setText(" | ".join(summary_parts))
         else:
             self.detail_summary.setText("No week data available")
 
@@ -627,8 +675,29 @@ class BacktestTab(QWidget):
     # ── Stats ─────────────────────────────────────────────────────────
 
     def _fill_stats(self, thresholds, lookbacks, accuracy, draw_stats,
-                    odds_stats, roi_stats, weekly):
+                    odds_stats, roi_stats, weekly, result=None):
         lines = []
+
+        # Per-season breakdown (if multi-season)
+        per_season = result.get("_per_season") if result else None
+        seasons = result.get("seasons", []) if result else []
+
+        if per_season and len(seasons) > 1:
+            from core.leagues import season_display
+            lines.append("PER-SEASON BREAKDOWN (best combo per season):")
+            lines.append("-" * 80)
+            for season in seasons:
+                bt = per_season[season]["bt"]
+                sb = bt["best"]
+                sr = bt.get("best_roi", (0, 0, -999))
+                lines.append(
+                    f"  {season_display(season):>9s}:  Best Acc: T={sb[0]:2d} LB={sb[1]:2d} -> {sb[2]:.1f}%"
+                    f"  |  Best ROI: T={sr[0]:2d} LB={sr[1]:2d} -> {sr[2]:+.1f}%"
+                )
+            lines.append("")
+
+        lines.append("AGGREGATE RESULTS" if per_season and len(seasons) > 1
+                     else "RESULTS")
         lines.append("=" * 95)
         lines.append(f"{'T':>3} {'LB':>3} | {'Acc%':>6} | {'Draws':>12} | "
                      f"{'Avg Odds':>8} | {'B365 ROI':>8} | {'Profit':>8} | {'Bets':>5}")
@@ -655,6 +724,41 @@ class BacktestTab(QWidget):
                 )
 
         lines.append("=" * 95)
+
+        # Per-season consistency for top combos
+        if per_season and len(seasons) > 1:
+            from core.leagues import season_display
+            # Find combos profitable in most seasons
+            combo_season_wins = {}
+            for t in thresholds:
+                for lb in lookbacks:
+                    wins = 0
+                    for season in seasons:
+                        bt = per_season[season]["bt"]
+                        sr = bt["roi_stats"].get(t, {}).get(lb, {})
+                        if sr.get("roi_pct", 0) > 0 and sr.get("stakes", 0) >= 10:
+                            wins += 1
+                    if wins > 0:
+                        agg_roi = roi_stats.get(t, {}).get(lb, {}).get("roi_pct", 0)
+                        combo_season_wins[(t, lb)] = (wins, agg_roi)
+
+            if combo_season_wins:
+                top_consistent = sorted(combo_season_wins.items(),
+                                        key=lambda x: (x[1][0], x[1][1]), reverse=True)[:8]
+                lines.append(f"\nCONSISTENT COMBOS (profitable across most seasons):")
+                for (t, lb), (wins, agg_roi) in top_consistent:
+                    acc = accuracy.get(t, {}).get(lb, 0)
+                    season_detail = []
+                    for season in seasons:
+                        bt = per_season[season]["bt"]
+                        sr = bt["roi_stats"].get(t, {}).get(lb, {})
+                        roi = sr.get("roi_pct", 0)
+                        season_detail.append(f"{season_display(season)}:{roi:+.0f}%")
+                    lines.append(
+                        f"  T={t:2d} LB={lb:2d} | {wins}/{len(seasons)} seasons profitable | "
+                        f"Agg ROI: {agg_roi:+.1f}% | Acc: {acc:.1f}%"
+                    )
+                    lines.append(f"    {' | '.join(season_detail)}")
 
         # Profitable combos
         profitable = []
