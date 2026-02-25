@@ -1,10 +1,11 @@
-"""Download match data from football-data.co.uk.
+"""Download match data from football-data.co.uk and fixtures from openfootball.
 
-Downloads both the season results CSV (which may contain upcoming fixtures
-as rows with no FTR) AND the dedicated fixtures.csv which has all upcoming
-fixtures across all leagues.
+Results come from football-data.co.uk season CSVs.
+Fixtures (upcoming matches) come from openfootball/football.json on GitHub,
+with football-data.co.uk fixtures.csv as a fallback.
 """
 
+import json
 import random
 import time
 from io import StringIO
@@ -14,7 +15,7 @@ import requests
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 from core.leagues import (get_results_url, get_past_season_codes, season_display,
-                         get_fd_slug, get_current_season_code, FD_TEAM_MAP)
+                         get_of_json, get_current_season_code, OPENFOOTBALL_TEAM_MAP)
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -24,7 +25,7 @@ USER_AGENTS = [
 ]
 
 FIXTURES_URL = "https://www.football-data.co.uk/fixtures.csv"
-FD_BASE_URL = "https://fixturedownload.com/download"
+OPENFOOTBALL_BASE = "https://raw.githubusercontent.com/openfootball/football.json/master"
 
 
 def _fetch_csv(url: str, retries: int = 5) -> str:
@@ -85,53 +86,69 @@ def download_fixtures() -> pd.DataFrame:
     return _parse_csv_text(text)
 
 
-def download_fixtures_fd(league_code: str) -> pd.DataFrame:
-    """Download fixtures from fixturedownload.com as a backup source.
+def download_fixtures_openfootball(league_code: str) -> pd.DataFrame:
+    """Download fixtures from openfootball/football.json on GitHub.
+
+    This is the primary fixture source — it's a community-maintained dataset
+    on GitHub that covers all major European leagues and is reliably accessible.
 
     Returns a DataFrame with HomeTeam, AwayTeam, Date columns
     (team names mapped to football-data.co.uk convention).
     Returns empty DataFrame if not available for this league.
     """
-    slug = get_fd_slug(league_code)
-    if not slug:
+    of_json = get_of_json(league_code)
+    if not of_json:
         return pd.DataFrame()
 
-    # Season code: fixturedownload uses start year, e.g. "epl-2025" for 2025-26
     season = get_current_season_code()
     start_year = 2000 + int(season[:2])
-    url = f"{FD_BASE_URL}/{slug}-{start_year}-csv"
+    end_year = start_year + 1
+    season_path = f"{start_year % 100:02d}{end_year % 100:02d}"
+    # openfootball uses "2025-26" format
+    season_dir = f"{start_year}-{end_year % 100:02d}"
+    url = f"{OPENFOOTBALL_BASE}/{season_dir}/{of_json}"
 
     try:
-        text = _fetch_csv(url)
-        df = _parse_csv_text(text)
+        text = _fetch_csv(url)  # works for any text, not just CSV
+        data = json.loads(text)
     except Exception:
         return pd.DataFrame()
 
-    # Expected columns: Round Number, Date, Location, Home Team, Away Team, Result
-    if "Home Team" not in df.columns or "Away Team" not in df.columns:
+    matches = data.get("matches", [])
+    if not matches:
         return pd.DataFrame()
 
-    # Filter to unplayed matches (Result is empty or NaN)
-    if "Result" in df.columns:
-        unplayed = df["Result"].isna() | (df["Result"].str.strip() == "")
-        df = df[unplayed].copy()
+    # Filter to unplayed matches (no score or no full-time score)
+    unplayed = []
+    for m in matches:
+        score = m.get("score")
+        if not score or not score.get("ft"):
+            unplayed.append(m)
 
-    if df.empty:
+    if not unplayed:
         return pd.DataFrame()
 
-    # Map team names to football-data.co.uk convention
-    df["HomeTeam"] = df["Home Team"].map(lambda t: FD_TEAM_MAP.get(t, t))
-    df["AwayTeam"] = df["Away Team"].map(lambda t: FD_TEAM_MAP.get(t, t))
+    rows = []
+    for m in unplayed:
+        home = m.get("team1", "")
+        away = m.get("team2", "")
+        date_str = m.get("date", "")
 
-    # Parse date
-    if "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+        # Map openfootball names to football-data.co.uk names
+        home_mapped = OPENFOOTBALL_TEAM_MAP.get(home, home)
+        away_mapped = OPENFOOTBALL_TEAM_MAP.get(away, away)
 
-    # Add dummy columns to match football-data format
-    df["FTR"] = ""
-    df["Div"] = league_code
+        rows.append({
+            "Div": league_code,
+            "Date": date_str,
+            "HomeTeam": home_mapped,
+            "AwayTeam": away_mapped,
+            "FTR": "",
+        })
 
-    return df[["Div", "Date", "HomeTeam", "AwayTeam", "FTR"]].reset_index(drop=True)
+    df = pd.DataFrame(rows)
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -180,40 +197,44 @@ class DownloadWorker(QObject):
                 f"  Current season: {played} played, {upcoming} upcoming."
             )
 
-            # Also download the dedicated fixtures file
-            self.progress.emit("Downloading fixtures.csv (all leagues)...")
+            # Download fixtures from openfootball (primary source - GitHub hosted, reliable)
+            self.progress.emit("Downloading fixtures from openfootball...")
             league_fixtures = pd.DataFrame()
             try:
-                fixtures_df = download_fixtures()
-                if "Div" in fixtures_df.columns:
-                    league_fixtures = fixtures_df[
-                        fixtures_df["Div"] == self.league_code
-                    ].copy()
+                of_fixtures = download_fixtures_openfootball(self.league_code)
+                if not of_fixtures.empty:
+                    league_fixtures = of_fixtures
                     self.progress.emit(
-                        f"  Fixtures: {len(league_fixtures)} upcoming for {self.league_code} "
-                        f"(from {len(fixtures_df)} total across all leagues)."
+                        f"  Fixtures: {len(of_fixtures)} upcoming from openfootball"
                     )
                 else:
-                    self.progress.emit(
-                        f"  Fixtures: no Div column to filter by."
-                    )
+                    self.progress.emit("  No fixtures from openfootball for this league.")
             except Exception as e:
-                self.progress.emit(f"  Warning: Could not download fixtures.csv: {e}")
+                self.progress.emit(f"  Warning: openfootball failed: {e}")
 
-            # If no fixtures from football-data, try fixturedownload.com backup
+            # Fallback: try football-data.co.uk fixtures.csv
             if league_fixtures.empty:
-                self.progress.emit("Trying fixturedownload.com backup...")
+                self.progress.emit("Trying football-data.co.uk fixtures.csv fallback...")
                 try:
-                    fd_fixtures = download_fixtures_fd(self.league_code)
-                    if not fd_fixtures.empty:
-                        league_fixtures = fd_fixtures
-                        self.progress.emit(
-                            f"  Backup: {len(fd_fixtures)} future fixtures from fixturedownload.com"
-                        )
+                    fixtures_df = download_fixtures()
+                    if "Div" in fixtures_df.columns:
+                        fd_fixtures = fixtures_df[
+                            fixtures_df["Div"] == self.league_code
+                        ].copy()
+                        if not fd_fixtures.empty:
+                            league_fixtures = fd_fixtures
+                            self.progress.emit(
+                                f"  Fallback: {len(fd_fixtures)} fixtures from football-data.co.uk"
+                            )
+                        else:
+                            self.progress.emit("  Fallback: no fixtures for this league.")
                     else:
-                        self.progress.emit("  Backup: no fixtures available either.")
+                        self.progress.emit("  Fallback: no Div column to filter by.")
                 except Exception as e:
-                    self.progress.emit(f"  Backup failed: {e}")
+                    self.progress.emit(f"  Fallback also failed: {e}")
+
+            if league_fixtures.empty:
+                self.progress.emit("  No fixtures found from any source.")
 
             self.finished.emit({
                 "results": current_df,
