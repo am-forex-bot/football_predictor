@@ -45,10 +45,16 @@ class PredictorConfig:
     threshold: float = 3.0
     no_bet_band: float = 0.0
     heavy_loss_gd: int = -2
+    big_win_gd: int = 3            # GD threshold for "big win" bonus
 
     win_weights: Dict[str, Dict[str, float]] = field(default_factory=lambda: {
         "Home": {"T1": 7, "T2": 6, "T3": 5, "T4": 4, "T5": 3, "T6": 2, "T7": 1},
         "Away": {"T1": 8, "T2": 7, "T3": 6, "T4": 5, "T5": 4, "T6": 3, "T7": 2},
+    })
+    # Extra points on top of win_weights when GD >= big_win_gd
+    big_win_bonus: Dict[str, Dict[str, float]] = field(default_factory=lambda: {
+        "Home": {"T1": 2, "T2": 2, "T3": 2, "T4": 1, "T5": 1, "T6": 1, "T7": 1},
+        "Away": {"T1": 2, "T2": 2, "T3": 2, "T4": 1, "T5": 1, "T6": 1, "T7": 1},
     })
     draw_weights: Dict[str, Dict[str, float]] = field(default_factory=lambda: {
         "Home": {"T1": 5, "T2": 4, "T3": 3, "T4": 2, "T5": 1, "T6": 0, "T7": -1},
@@ -113,6 +119,10 @@ class MatchPredictor:
                 wt[0, v_idx, t_idx] = cfg.win_weights[venue][tier]
                 wt[1, v_idx, t_idx] = cfg.draw_weights[venue][tier]
                 wt[2, v_idx, t_idx] = cfg.loss_close_weights[venue][tier]
+        self._big_win_table = np.zeros((2, 7), dtype=np.float64)
+        for v_idx, venue in enumerate(["Home", "Away"]):
+            for t_idx, tier in enumerate(TIERS):
+                self._big_win_table[v_idx, t_idx] = cfg.big_win_bonus[venue][tier]
         return wt
 
     def _score_match(self, result: str, venue: str, opp_category: str,
@@ -121,7 +131,11 @@ class MatchPredictor:
         tier = CATEGORY_TO_TIER.get(str(opp_category).upper()[:1], "T4")
         cfg = self.config
         if result == "W":
-            return cfg.win_weights[venue][tier]
+            base = cfg.win_weights[venue][tier]
+            gd = gf - ga
+            if gd >= cfg.big_win_gd:
+                base += cfg.big_win_bonus[venue][tier]
+            return base
         if result == "D":
             return cfg.draw_weights[venue][tier]
         base = cfg.loss_close_weights[venue][tier]
@@ -173,6 +187,18 @@ class MatchPredictor:
         heavy_away = (away_res == 2) & (gd_away <= heavy_gd)
         away_scores[heavy_away] += penalty
 
+        # Big win bonus
+        big_gd = self.config.big_win_gd
+        bwt = self._big_win_table
+
+        big_home = (home_res == 0) & (gd_home >= big_gd)
+        if big_home.any():
+            home_scores[big_home] += bwt[venue_home[big_home], opp_tier[big_home]]
+
+        big_away = (away_res == 0) & ((-gd_home) >= big_gd)  # gd_away = ga - gf = -gd_home
+        if big_away.any():
+            away_scores[big_away] += bwt[venue_away[big_away], home_tier[big_away]]
+
         return home_scores.copy(), away_scores.copy()
 
     # ── Prefix sum infrastructure ────────────────────────────────────
@@ -213,7 +239,11 @@ class MatchPredictor:
         away_prefix = []
         for tid in range(n_teams):
             h_arr = np.array(home_score_lists[tid], dtype=np.float64)
+            if h_arr.ndim == 0:
+                h_arr = np.array([], dtype=np.float64)
             a_arr = np.array(away_score_lists[tid], dtype=np.float64)
+            if a_arr.ndim == 0:
+                a_arr = np.array([], dtype=np.float64)
             home_prefix.append(np.concatenate([[0.0], np.cumsum(h_arr)]))
             away_prefix.append(np.concatenate([[0.0], np.cumsum(a_arr)]))
 
@@ -239,6 +269,15 @@ class MatchPredictor:
                       if "Max_Away_Odds" in results_df.columns
                       else a_odds.copy())
 
+        # Gameweek assignments (date-based if available, else positional)
+        from core.cleaner import assign_gameweeks
+        try:
+            gw_series = assign_gameweeks(results_df)
+            gameweeks = np.asarray(gw_series).flatten().astype(np.int32)
+        except Exception:
+            gpw = max(n_teams // 2, 1)
+            gameweeks = np.array([i // gpw + 1 for i in range(N)], dtype=np.int32)
+
         # Actual results as integers
         result_vals = results_df["Result"].values
         actuals = np.array([_RESULT_TO_IDX.get(r, 1) for r in result_vals], dtype=np.int32)
@@ -261,6 +300,7 @@ class MatchPredictor:
             "max_h_odds": max_h_odds,
             "max_d_odds": max_d_odds,
             "max_a_odds": max_a_odds,
+            "gameweeks": gameweeks,
         }
 
     # ── Live prediction ──────────────────────────────────────────────
@@ -347,6 +387,16 @@ class MatchPredictor:
 
             implied_prob = round(1.0 / pred_odds * 100, 1) if pred_odds else None
 
+            # Fixture date (if available)
+            fix_date = fix.get("Date", None)
+            if pd.notna(fix_date):
+                try:
+                    fix_date = pd.Timestamp(fix_date)
+                except Exception:
+                    fix_date = None
+            else:
+                fix_date = None
+
             predictions.append({
                 "home_team": home,
                 "away_team": away,
@@ -361,6 +411,7 @@ class MatchPredictor:
                 "away_odds": a_val,
                 "pred_odds": pred_odds,
                 "implied_prob": implied_prob,
+                "date": fix_date,
             })
             predicted_teams.add(home)
             predicted_teams.add(away)
@@ -371,8 +422,12 @@ class MatchPredictor:
 
     def _run_grid(self, prefix_data: dict,
                   threshold_min: int, threshold_max: int,
-                  lookback_min: int, lookback_max: int):
+                  lookback_min: int, lookback_max: int,
+                  no_bet_band: float = 0.0):
         """Core grid search — vectorized. All profit/ROI uses Bet365 odds.
+
+        no_bet_band: if > 0, matches where abs(diff) <= no_bet_band are skipped
+        (no prediction made). Must be < threshold.
 
         Returns (accuracy, draw_stats, odds_stats, roi_stats, best_acc, best_roi, lookback_cache).
         """
@@ -387,6 +442,9 @@ class MatchPredictor:
         d_odds = prefix_data["d_odds"]
         a_odds = prefix_data["a_odds"]
         N = prefix_data["N"]
+        gameweeks = prefix_data.get("gameweeks")
+        if gameweeks is not None and np.ndim(gameweeks) == 0:
+            gameweeks = None
 
         accuracy = {}
         draw_stats = {}
@@ -435,25 +493,41 @@ class MatchPredictor:
             elig_d_odds = d_odds[eidx]
             elig_a_odds = a_odds[eidx]
 
+            elig_gws = gameweeks[eidx] if gameweeks is not None else None
+            # Guard against scalar result from indexing
+            if elig_gws is not None and np.ndim(elig_gws) == 0:
+                elig_gws = None
             lookback_cache[lookback] = (eidx, diffs, elig_actuals,
-                                        elig_h_odds, elig_d_odds, elig_a_odds)
+                                        elig_h_odds, elig_d_odds, elig_a_odds,
+                                        elig_gws)
 
             # Sweep thresholds
             for threshold in range(threshold_min, threshold_max + 1):
                 predicted = np.where(diffs > threshold, 0,
                             np.where(diffs < -threshold, 2, 1)).astype(np.int32)
 
-                correct_mask = predicted == elig_actuals
-                correct_count = int(correct_mask.sum())
-                total_count = n_eligible
+                # Apply no_bet_band: exclude matches where abs(diff) <= no_bet_band
+                if no_bet_band > 0:
+                    bet_mask = np.abs(diffs) > no_bet_band
+                else:
+                    bet_mask = np.ones(n_eligible, dtype=bool)
 
-                d_pred_mask = predicted == 1
-                d_correct = int((d_pred_mask & (elig_actuals == 1)).sum())
+                pred_bet = predicted[bet_mask]
+                act_bet = elig_actuals[bet_mask]
+                n_bet = int(bet_mask.sum())
+
+                correct_mask_full = predicted == elig_actuals
+                correct_mask = pred_bet == act_bet
+                correct_count = int(correct_mask.sum())
+
+                d_pred_mask = pred_bet == 1
+                d_correct = int((d_pred_mask & (act_bet == 1)).sum())
                 d_predicted = int(d_pred_mask.sum())
 
-                # B365 odds for predictions
-                pred_odds = np.where(predicted == 0, elig_h_odds,
+                # B365 odds for predictions (only on matches we bet on)
+                pred_odds_full = np.where(predicted == 0, elig_h_odds,
                             np.where(predicted == 1, elig_d_odds, elig_a_odds))
+                pred_odds = pred_odds_full[bet_mask]
                 correct_odds = pred_odds[correct_mask]
                 valid_odds = correct_odds[correct_odds > 0]
                 odds_combined = float(valid_odds.sum())
@@ -464,7 +538,7 @@ class MatchPredictor:
                 stakes = int(has_odds.sum())
                 returns = float(valid_odds.sum())
 
-                acc = (correct_count / total_count * 100) if total_count else 0.0
+                acc = (correct_count / n_bet * 100) if n_bet else 0.0
 
                 accuracy.setdefault(threshold, {})[lookback] = acc
                 draw_stats.setdefault(threshold, {})[lookback] = {
@@ -472,7 +546,7 @@ class MatchPredictor:
                 }
                 odds_stats.setdefault(threshold, {})[lookback] = {
                     "combined": odds_combined,
-                    "total": total_count,
+                    "total": n_bet,
                     "avg": (odds_combined / correct_with_odds) if correct_with_odds else 0.0,
                 }
                 roi_stats.setdefault(threshold, {})[lookback] = {
@@ -482,12 +556,19 @@ class MatchPredictor:
                     "roi_pct": round((returns - stakes) / stakes * 100, 2) if stakes else 0.0,
                 }
 
-        # Find best by accuracy
+        # Find best by accuracy (minimum 20 bets to avoid flukes like 1/1 = 100%)
         best_acc = (threshold_min, lookback_min, 0.0)
+        best_acc_no_min = (threshold_min, lookback_min, 0.0)
         for t, lb_dict in accuracy.items():
             for lb, acc in lb_dict.items():
-                if acc > best_acc[2]:
+                if acc > best_acc_no_min[2]:
+                    best_acc_no_min = (t, lb, acc)
+                n_bets = roi_stats.get(t, {}).get(lb, {}).get("stakes", 0)
+                if n_bets >= 20 and acc > best_acc[2]:
                     best_acc = (t, lb, acc)
+        # Fall back to no-minimum if nothing qualified
+        if best_acc[2] == 0.0:
+            best_acc = best_acc_no_min
 
         # Find best by ROI (minimum 20 bets to avoid flukes)
         best_roi = (threshold_min, lookback_min, -999.0)
@@ -501,7 +582,8 @@ class MatchPredictor:
     def backtest(self, results_df: pd.DataFrame,
                  league_table_df: pd.DataFrame,
                  threshold_min: int = 1, threshold_max: int = 20,
-                 lookback_min: int = 3, lookback_max: int = 20) -> dict:
+                 lookback_min: int = 3, lookback_max: int = 20,
+                 no_bet_band: float = 0.0) -> dict:
         """Grid search across threshold/lookback combos for a SINGLE season.
 
         Returns accuracy grid, draw stats, odds stats, ROI stats, best combos,
@@ -514,6 +596,7 @@ class MatchPredictor:
 
         accuracy, draw_stats, odds_stats, roi_stats, best_acc, best_roi, lb_cache = self._run_grid(
             pd_data, threshold_min, threshold_max, lookback_min, lookback_max,
+            no_bet_band=no_bet_band,
         )
 
         return {
@@ -525,11 +608,13 @@ class MatchPredictor:
             "best_roi": best_roi,
             "_lb_cache": lb_cache,
             "_n_teams": pd_data["n_teams"],
+            "_no_bet_band": no_bet_band,
         }
 
     def backtest_multi_season(self, results_df: pd.DataFrame,
                                threshold_min: int = 1, threshold_max: int = 20,
-                               lookback_min: int = 3, lookback_max: int = 20) -> dict:
+                               lookback_min: int = 3, lookback_max: int = 20,
+                               no_bet_band: float = 0.0) -> dict:
         """Run INDEPENDENT backtests per season and aggregate results.
 
         Lookback never straddles season boundaries — each season starts fresh.
@@ -550,7 +635,8 @@ class MatchPredictor:
             season_table = build_league_table(season_df)
             bt = self.backtest(season_df, season_table,
                                threshold_min, threshold_max,
-                               lookback_min, lookback_max)
+                               lookback_min, lookback_max,
+                               no_bet_band=no_bet_band)
             per_season[season] = {
                 "results_df": season_df,
                 "table_df": season_table,
@@ -578,7 +664,7 @@ class MatchPredictor:
                     bt = per_season[season]["bt"]
                     n = bt["odds_stats"].get(t, {}).get(lb, {}).get("total", 0)
                     acc = bt["accuracy"].get(t, {}).get(lb, 0.0)
-                    correct = round(acc / 100 * n) if n > 0 else 0
+                    correct = int(round(acc / 100 * n)) if n > 0 else 0
 
                     total_correct += correct
                     total_eligible += n
@@ -591,7 +677,7 @@ class MatchPredictor:
                     total_odds_combined += os_data.get("combined", 0.0)
                     avg_o = os_data.get("avg", 0.0)
                     if avg_o > 0 and os_data.get("combined", 0) > 0:
-                        total_correct_with_odds += round(os_data["combined"] / avg_o)
+                        total_correct_with_odds += int(round(os_data["combined"] / avg_o))
 
                     rs = bt["roi_stats"].get(t, {}).get(lb, {})
                     total_stakes += rs.get("stakes", 0)
@@ -620,12 +706,19 @@ class MatchPredictor:
                     "roi_pct": round(profit / total_stakes * 100, 2) if total_stakes else 0.0,
                 }
 
-        # Best aggregate accuracy
+        # Best aggregate accuracy (minimum bets to avoid flukes)
+        min_stakes_acc = max(50, len(seasons) * 10)
         best_acc = (threshold_min, lookback_min, 0.0)
+        best_acc_no_min = (threshold_min, lookback_min, 0.0)
         for t, lb_dict in agg_accuracy.items():
             for lb, acc in lb_dict.items():
-                if acc > best_acc[2]:
+                if acc > best_acc_no_min[2]:
+                    best_acc_no_min = (t, lb, acc)
+                n_bets = agg_roi_stats.get(t, {}).get(lb, {}).get("stakes", 0)
+                if n_bets >= min_stakes_acc and acc > best_acc[2]:
                     best_acc = (t, lb, acc)
+        if best_acc[2] == 0.0:
+            best_acc = best_acc_no_min
 
         # Best aggregate ROI (higher minimum stakes across multi-season)
         min_stakes = max(50, len(seasons) * 20)
@@ -696,7 +789,7 @@ class MatchPredictor:
                         continue
                     total_games += r["total_games"]
                     if r["total_games"] > 0:
-                        total_correct_est += round(r["accuracy"] / 100 * r["total_games"])
+                        total_correct_est += int(round(r["accuracy"] / 100 * r["total_games"]))
                     total_perfect += r["perfect_weeks"]
                     total_ge90 += r["weeks_ge90"]
                     total_ge80 += r["weeks_ge80"]
@@ -834,7 +927,7 @@ class MatchPredictor:
                             bt = per_season[ts]["bt"]
                             n_elig = bt["odds_stats"].get(t, {}).get(lb, {}).get("total", 0)
                             acc = bt["accuracy"].get(t, {}).get(lb, 0.0)
-                            total_correct += round(acc / 100 * n_elig) if n_elig > 0 else 0
+                            total_correct += int(round(acc / 100 * n_elig)) if n_elig > 0 else 0
                             total_eligible += n_elig
 
                             rs = bt["roi_stats"].get(t, {}).get(lb, {})
@@ -945,7 +1038,7 @@ class MatchPredictor:
                         bt = per_season[ts]["bt"]
                         n_elig = bt["odds_stats"].get(t, {}).get(lb, {}).get("total", 0)
                         acc = bt["accuracy"].get(t, {}).get(lb, 0.0)
-                        total_correct += round(acc / 100 * n_elig) if n_elig > 0 else 0
+                        total_correct += int(round(acc / 100 * n_elig)) if n_elig > 0 else 0
                         total_eligible += n_elig
                         rs = bt["roi_stats"].get(t, {}).get(lb, {})
                         total_stakes += rs.get("stakes", 0)
@@ -976,6 +1069,37 @@ class MatchPredictor:
             "recommendations": recommendations,
             "seasons": seasons,
         }
+
+    # ── Gameweek iteration helper ──────────────────────────────────
+
+    @staticmethod
+    def _iter_gameweeks(n_elig, games_per_week, elig_gameweeks=None):
+        """Yield (start, end) slices for each gameweek.
+
+        If elig_gameweeks is provided (date-based), groups by actual gameweek.
+        Otherwise falls back to fixed chunks of games_per_week.
+        """
+        # Fall back to chunked approach if elig_gameweeks is unusable
+        if elig_gameweeks is not None:
+            elig_gameweeks = np.asarray(elig_gameweeks)
+            if elig_gameweeks.ndim == 0 or len(elig_gameweeks) == 0:
+                elig_gameweeks = None
+        if elig_gameweeks is not None:
+            # Group by actual gameweek number
+            unique_gws = []
+            seen = set()
+            for gw in elig_gameweeks:
+                if gw not in seen:
+                    unique_gws.append(gw)
+                    seen.add(gw)
+
+            for gw in unique_gws:
+                indices = np.where(elig_gameweeks == gw)[0]
+                if len(indices) > 0:
+                    yield int(indices[0]), int(indices[-1]) + 1
+        else:
+            for w_start in range(0, n_elig, games_per_week):
+                yield w_start, min(w_start + games_per_week, n_elig)
 
     # ── Weekly performance ───────────────────────────────────────────
 
@@ -1020,7 +1144,7 @@ class MatchPredictor:
                     })
                 continue
 
-            eidx, diffs, elig_actuals, elig_h_odds, elig_d_odds, elig_a_odds = cached
+            eidx, diffs, elig_actuals, elig_h_odds, elig_d_odds, elig_a_odds, elig_gws = cached
 
             for threshold in range(threshold_min, threshold_max + 1):
                 predicted = np.where(diffs > threshold, 0,
@@ -1049,8 +1173,7 @@ class MatchPredictor:
                 acca_total_returns = 0.0
                 acca_best = 0.0
 
-                for w_start in range(0, n_elig, games_per_week):
-                    w_end = min(w_start + games_per_week, n_elig)
+                for w_start, w_end in self._iter_gameweeks(n_elig, games_per_week, elig_gws):
                     w_correct = correct_mask[w_start:w_end]
                     w_pred_odds = pred_odds[w_start:w_end]
                     if len(w_correct) < min_week_games:
@@ -1131,7 +1254,7 @@ class MatchPredictor:
         if cached is None:
             return []
 
-        eidx, diffs, elig_actuals, elig_h_odds, elig_d_odds, elig_a_odds = cached
+        eidx, diffs, elig_actuals, elig_h_odds, elig_d_odds, elig_a_odds, elig_gws = cached
 
         predicted = np.where(diffs > threshold, 0,
                     np.where(diffs < -threshold, 2, 1)).astype(np.int32)
@@ -1144,8 +1267,7 @@ class MatchPredictor:
         cum_flat = 0.0
         cum_acca = 0.0
 
-        for w_start in range(0, n_elig, games_per_week):
-            w_end = min(w_start + games_per_week, n_elig)
+        for w_start, w_end in self._iter_gameweeks(n_elig, games_per_week, elig_gws):
             w_correct = correct_mask[w_start:w_end]
             w_pred_odds = pred_odds[w_start:w_end]
 
@@ -1185,6 +1307,228 @@ class MatchPredictor:
             })
 
         return weeks
+
+    # ── Betting strategy — all multiples ─────────────────────────────
+
+    def betting_strategy_analysis(self, results_df: pd.DataFrame,
+                                  league_table_df: pd.DataFrame,
+                                  threshold: int, lookback: int,
+                                  min_week_games: int = 3,
+                                  stake: float = 1.0,
+                                  max_fold: int = 15,
+                                  backtest_result: dict | None = None) -> dict:
+        """Full multiples P&L for a specific threshold/lookback combo.
+
+        For each gameweek computes P&L for every fold size (singles → N-fold).
+        Returns aggregate summary and per-week breakdown.
+        """
+        if backtest_result is None:
+            backtest_result = self.backtest(
+                results_df, league_table_df,
+                threshold_min=threshold, threshold_max=threshold,
+                lookback_min=lookback, lookback_max=lookback,
+            )
+
+        lb_cache = backtest_result["_lb_cache"]
+        n_teams = backtest_result["_n_teams"]
+        games_per_week = max(n_teams // 2, 1)
+
+        cached = lb_cache.get(lookback)
+        if cached is None:
+            return {"fold_summary": {}, "weeks": [], "per_season": {}}
+
+        eidx, diffs, elig_actuals, elig_h_odds, elig_d_odds, elig_a_odds, elig_gws = cached
+
+        predicted = np.where(diffs > threshold, 0,
+                    np.where(diffs < -threshold, 2, 1)).astype(np.int32)
+        correct_mask = (predicted == elig_actuals)
+        pred_odds = np.where(predicted == 0, elig_h_odds,
+                    np.where(predicted == 1, elig_d_odds, elig_a_odds))
+
+        n_elig = len(correct_mask)
+        fold_totals: dict[int, dict] = {}
+        week_rows: list[dict] = []
+
+        for w_start, w_end in self._iter_gameweeks(n_elig, games_per_week, elig_gws):
+            w_cm = correct_mask[w_start:w_end]
+            w_po = pred_odds[w_start:w_end]
+            if len(w_cm) < min_week_games:
+                continue
+            valid = w_po > 0
+            if valid.sum() == 0:
+                continue
+
+            mults = _compute_week_multiples(
+                w_cm[valid], w_po[valid],
+                max_fold=min(max_fold, int(valid.sum())),
+                stake=stake,
+            )
+
+            week_rows.append({
+                "week": len(week_rows) + 1,
+                "games": int(valid.sum()),
+                "correct": int(w_cm[valid].sum()),
+                "accuracy": round(float(w_cm[valid].sum()) / int(valid.sum()) * 100, 1),
+                "multiples": mults,
+            })
+
+            for k, data in mults.items():
+                if k not in fold_totals:
+                    fold_totals[k] = {
+                        "staked": 0.0, "returned": 0.0, "winners": 0,
+                        "best_payout": 0.0, "winning_weeks": 0, "total_weeks": 0,
+                        "lines_per_week": data["lines"],
+                    }
+                ft = fold_totals[k]
+                ft["staked"] += data["staked"]
+                ft["returned"] += data["returned"]
+                ft["winners"] += data["winners"]
+                ft["total_weeks"] += 1
+                if data["best_payout"] > ft["best_payout"]:
+                    ft["best_payout"] = data["best_payout"]
+                if data["winners"] > 0:
+                    ft["winning_weeks"] += 1
+
+        fold_summary = _build_fold_summary(fold_totals, stake)
+        return {"fold_summary": fold_summary, "weeks": week_rows, "per_season": {}}
+
+    def betting_strategy_multi(self, multi_bt: dict,
+                               threshold: int, lookback: int,
+                               min_week_games: int = 3,
+                               stake: float = 1.0,
+                               max_fold: int = 15) -> dict:
+        """Multiples analysis across multiple seasons with per-season breakdown."""
+        from core.leagues import season_display
+
+        per_season = multi_bt["_per_season"]
+        seasons = multi_bt["seasons"]
+
+        all_fold_totals: dict[int, dict] = {}
+        per_season_summaries: dict[str, dict] = {}
+        all_weeks: list[dict] = []
+
+        for season in seasons:
+            sc = per_season[season]
+            result = self.betting_strategy_analysis(
+                sc["results_df"], sc["table_df"],
+                threshold, lookback,
+                min_week_games=min_week_games,
+                stake=stake, max_fold=max_fold,
+                backtest_result=sc["bt"],
+            )
+
+            sd = season_display(season)
+            per_season_summaries[sd] = result["fold_summary"]
+
+            for w in result["weeks"]:
+                w["season"] = sd
+                w["week"] = len(all_weeks) + 1
+                all_weeks.append(w)
+
+            for k, data in result["fold_summary"].items():
+                if k not in all_fold_totals:
+                    all_fold_totals[k] = {
+                        "staked": 0.0, "returned": 0.0, "winners": 0,
+                        "best_payout": 0.0, "winning_weeks": 0, "total_weeks": 0,
+                        "lines_per_week": data["lines_per_week"],
+                    }
+                ft = all_fold_totals[k]
+                ft["staked"] += data["staked"]
+                ft["returned"] += data["returned"]
+                ft["winners"] += data["winners"]
+                ft["total_weeks"] += data["total_weeks"]
+                if data["best_payout"] > ft["best_payout"]:
+                    ft["best_payout"] = data["best_payout"]
+                ft["winning_weeks"] += data["winning_weeks"]
+
+        fold_summary = _build_fold_summary(all_fold_totals, stake)
+        return {
+            "fold_summary": fold_summary,
+            "weeks": all_weeks,
+            "per_season": per_season_summaries,
+        }
+
+
+# ───────────────────────────────────────────────────────────────────────
+# Multiples helpers
+# ───────────────────────────────────────────────────────────────────────
+
+def _fold_name(k: int) -> str:
+    return {1: "Singles", 2: "Doubles", 3: "Trebles"}.get(k, f"{k}-Folds")
+
+
+def _compute_week_multiples(correct_mask, odds, max_fold=None, stake=1.0) -> dict:
+    """Compute P&L for every fold size for one gameweek.
+
+    correct_mask: bool array of whether each prediction was correct
+    odds: float array of decimal odds for each prediction
+    Returns: {fold_size: {fold, name, lines, winners, staked, returned, profit, best_payout}}
+    """
+    from itertools import combinations as _combs
+    from math import comb as _comb
+
+    n = len(correct_mask)
+    if max_fold is None:
+        max_fold = n
+    max_fold = min(max_fold, n)
+
+    correct_idx = [i for i in range(n) if correct_mask[i]]
+    n_correct = len(correct_idx)
+
+    results = {}
+    for k in range(1, max_fold + 1):
+        n_combos = _comb(n, k)
+        total_staked = n_combos * stake
+        n_winners = _comb(n_correct, k)
+
+        total_returned = 0.0
+        best_payout = 0.0
+
+        if n_winners > 0:
+            for combo in _combs(correct_idx, k):
+                payout = stake
+                for idx in combo:
+                    payout *= odds[idx]
+                total_returned += payout
+                if payout > best_payout:
+                    best_payout = payout
+
+        results[k] = {
+            "fold": k,
+            "name": _fold_name(k),
+            "lines": n_combos,
+            "winners": n_winners,
+            "staked": round(total_staked, 2),
+            "returned": round(total_returned, 2),
+            "profit": round(total_returned - total_staked, 2),
+            "best_payout": round(best_payout, 2),
+        }
+
+    return results
+
+
+def _build_fold_summary(fold_totals: dict, stake: float) -> dict:
+    """Build clean summary dict from raw fold totals."""
+    summary = {}
+    for k in sorted(fold_totals.keys()):
+        ft = fold_totals[k]
+        profit = ft["returned"] - ft["staked"]
+        roi = (profit / ft["staked"] * 100) if ft["staked"] > 0 else 0
+        summary[k] = {
+            "fold": k,
+            "name": _fold_name(k),
+            "lines_per_week": ft["lines_per_week"],
+            "total_weeks": ft["total_weeks"],
+            "total_lines": int(ft["staked"] / stake) if stake > 0 else 0,
+            "staked": round(ft["staked"], 2),
+            "returned": round(ft["returned"], 2),
+            "profit": round(profit, 2),
+            "roi_pct": round(roi, 2),
+            "winners": ft["winners"],
+            "winning_weeks": ft["winning_weeks"],
+            "best_payout": round(ft["best_payout"], 2),
+        }
+    return summary
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -1249,6 +1593,20 @@ def random_weight_config(rng: random.Random,
     }
     cfgd["loss_heavy_penalty"] = round(rng.uniform(-2.5, -0.3), 2)
 
+    # Big win bonus — smaller values, always positive, descending by tier
+    bw_top = round(rng.uniform(1.0, 3.0), 2)
+    bw_bot = round(rng.uniform(0.5, 1.5), 2)
+    if bw_bot > bw_top:
+        bw_bot = bw_top
+    bw_home = [round(bw_top - (bw_top - bw_bot) * (i / max(len(TIERS) - 1, 1)), 2)
+               for i in range(len(TIERS))]
+    bw_away = [round(v + rng.uniform(0.0, 0.5), 2) for v in bw_home]
+    cfgd["big_win_bonus"] = {
+        "Home": dict(zip(TIERS, bw_home)),
+        "Away": dict(zip(TIERS, bw_away)),
+    }
+    cfgd["big_win_gd"] = rng.choice([2, 3, 3, 3, 4])  # mostly 3, sometimes 2 or 4
+
     return PredictorConfig(**cfgd)
 
 
@@ -1258,62 +1616,141 @@ def tune_weights(results_df: pd.DataFrame, league_table_df: pd.DataFrame,
                  threshold_min: int = 1, threshold_max: int = 20,
                  seed: int = 42,
                  progress_callback=None) -> dict:
-    """Tune weights with train/validation split to prevent overfitting.
+    """Tune weights using multi-season walk-forward validation.
 
-    First 70% of matches = training, last 30% = validation.
-    Ranks by blended accuracy (40% train + 60% validation).
+    If results_df has a 'Season' column with multiple seasons:
+        - Train on all seasons except the last 2
+        - Validate on the final 2 seasons
+        - For each candidate weight set, find best (threshold, lookback)
+          on training data, then measure out-of-sample on validation data.
+
+    If single-season:
+        - 70/30 split on matches within the season.
+
+    Returns leaderboard of candidates ranked by blended accuracy.
     """
+    from core.cleaner import build_league_table
+
     rng = random.Random(seed)
-
-    n_results = len(results_df)
-    split_idx = int(n_results * 0.7)
-    train_df = results_df.iloc[:split_idx].copy().reset_index(drop=True)
-    valid_df = results_df.iloc[split_idx:].copy().reset_index(drop=True)
-
     base_cfg = PredictorConfig()
+
+    is_multi = ("Season" in results_df.columns and
+                results_df["Season"].nunique() > 1)
+
+    if is_multi:
+        seasons = sorted(results_df["Season"].unique())
+        n_seasons = len(seasons)
+        # Use last 2 seasons (or last 1 if only 3 seasons) for validation
+        n_val = 2 if n_seasons >= 4 else 1
+        train_seasons = seasons[:-n_val]
+        valid_seasons = seasons[-n_val:]
+
+        train_dfs = {}  # season -> (results_df, table_df)
+        valid_dfs = {}
+        for s in train_seasons:
+            sdf = results_df[results_df["Season"] == s].reset_index(drop=True)
+            train_dfs[s] = (sdf, build_league_table(sdf))
+        for s in valid_seasons:
+            sdf = results_df[results_df["Season"] == s].reset_index(drop=True)
+            valid_dfs[s] = (sdf, build_league_table(sdf))
+    else:
+        # Single season: 70/30 split
+        n_results = len(results_df)
+        split_idx = int(n_results * 0.7)
+        train_single = results_df.iloc[:split_idx].copy().reset_index(drop=True)
+        valid_single = results_df.iloc[split_idx:].copy().reset_index(drop=True)
+
     leaderboard = []
 
     for cid in range(1, n_candidates + 1):
         cfg = random_weight_config(rng, base_cfg)
         predictor = MatchPredictor(cfg)
 
-        train_bt = predictor.backtest(
-            train_df, league_table_df,
-            threshold_min=threshold_min, threshold_max=threshold_max,
-            lookback_min=lookback_min, lookback_max=lookback_max,
-        )
+        # ── Train phase: find best (threshold, lookback) ──────────
+        if is_multi:
+            # Aggregate accuracy across training seasons
+            agg_correct = {}
+            agg_total = {}
+            for s in train_seasons:
+                sdf, tbl = train_dfs[s]
+                bt = predictor.backtest(sdf, tbl,
+                                        threshold_min, threshold_max,
+                                        lookback_min, lookback_max)
+                for t, lb_dict in bt["accuracy"].items():
+                    for lb, acc in lb_dict.items():
+                        n_elig = bt["odds_stats"].get(t, {}).get(lb, {}).get("total", 0)
+                        key = (t, lb)
+                        agg_correct[key] = agg_correct.get(key, 0) + int(round(acc / 100 * n_elig))
+                        agg_total[key] = agg_total.get(key, 0) + n_elig
 
-        best_train_acc = 0.0
-        best_lb = lookback_min
-        best_th = threshold_min
-        best_train_games = 0
-
-        for t, lb_dict in train_bt["accuracy"].items():
-            for lb, acc in lb_dict.items():
-                # Estimate game count from accuracy grid position
-                # (we can't easily get it without game_log, so use a heuristic)
+            best_train_acc = 0.0
+            best_combo = (threshold_min, lookback_min)
+            train_games = 0
+            for key, total in agg_total.items():
+                if total == 0:
+                    continue
+                acc = agg_correct[key] / total * 100
                 if acc > best_train_acc:
                     best_train_acc = acc
-                    best_lb = lb
-                    best_th = t
+                    best_combo = key
+                    train_games = total
 
-        val_bt = predictor.backtest(
-            valid_df, league_table_df,
-            threshold_min=best_th, threshold_max=best_th,
-            lookback_min=best_lb, lookback_max=best_lb,
-        )
-        val_acc = val_bt["accuracy"].get(best_th, {}).get(best_lb, 0.0)
+            # ── Validate on held-out seasons ──────────────────────
+            val_correct = 0
+            val_total = 0
+            for s in valid_seasons:
+                sdf, tbl = valid_dfs[s]
+                vbt = predictor.backtest(sdf, tbl,
+                                          threshold_min=best_combo[0],
+                                          threshold_max=best_combo[0],
+                                          lookback_min=best_combo[1],
+                                          lookback_max=best_combo[1])
+                n_elig = vbt["odds_stats"].get(best_combo[0], {}).get(
+                    best_combo[1], {}).get("total", 0)
+                vacc = vbt["accuracy"].get(best_combo[0], {}).get(best_combo[1], 0.0)
+                val_correct += int(round(vacc / 100 * n_elig))
+                val_total += n_elig
+
+            val_acc = (val_correct / val_total * 100) if val_total else 0.0
+            valid_games = val_total
+
+        else:
+            # Single season split
+            train_bt = predictor.backtest(
+                train_single, league_table_df,
+                threshold_min, threshold_max,
+                lookback_min, lookback_max,
+            )
+            best_train_acc = 0.0
+            best_combo = (threshold_min, lookback_min)
+            for t, lb_dict in train_bt["accuracy"].items():
+                for lb, acc in lb_dict.items():
+                    if acc > best_train_acc:
+                        best_train_acc = acc
+                        best_combo = (t, lb)
+
+            train_games = train_bt["odds_stats"].get(
+                best_combo[0], {}).get(best_combo[1], {}).get("total", 0)
+
+            val_bt = predictor.backtest(
+                valid_single, league_table_df,
+                threshold_min=best_combo[0], threshold_max=best_combo[0],
+                lookback_min=best_combo[1], lookback_max=best_combo[1],
+            )
+            val_acc = val_bt["accuracy"].get(best_combo[0], {}).get(best_combo[1], 0.0)
+            valid_games = val_bt["odds_stats"].get(
+                best_combo[0], {}).get(best_combo[1], {}).get("total", 0)
 
         blended = round(0.4 * best_train_acc + 0.6 * val_acc, 2)
 
         leaderboard.append({
             "candidate_id": cid,
-            "lookback": best_lb,
-            "threshold": best_th,
+            "lookback": best_combo[1],
+            "threshold": best_combo[0],
             "train_acc": round(best_train_acc, 2),
-            "train_games": 0,
+            "train_games": train_games,
             "valid_acc": round(val_acc, 2),
-            "valid_games": 0,
+            "valid_games": valid_games,
             "blended_acc": blended,
             "config": cfg,
         })

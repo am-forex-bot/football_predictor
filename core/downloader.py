@@ -13,7 +13,8 @@ import pandas as pd
 import requests
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
-from core.leagues import get_results_url, get_past_season_codes, season_display
+from core.leagues import (get_results_url, get_past_season_codes, season_display,
+                         get_fd_slug, get_current_season_code, FD_TEAM_MAP)
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -23,6 +24,7 @@ USER_AGENTS = [
 ]
 
 FIXTURES_URL = "https://www.football-data.co.uk/fixtures.csv"
+FD_BASE_URL = "https://fixturedownload.com/download"
 
 
 def _fetch_csv(url: str, retries: int = 5) -> str:
@@ -83,6 +85,55 @@ def download_fixtures() -> pd.DataFrame:
     return _parse_csv_text(text)
 
 
+def download_fixtures_fd(league_code: str) -> pd.DataFrame:
+    """Download fixtures from fixturedownload.com as a backup source.
+
+    Returns a DataFrame with HomeTeam, AwayTeam, Date columns
+    (team names mapped to football-data.co.uk convention).
+    Returns empty DataFrame if not available for this league.
+    """
+    slug = get_fd_slug(league_code)
+    if not slug:
+        return pd.DataFrame()
+
+    # Season code: fixturedownload uses start year, e.g. "epl-2025" for 2025-26
+    season = get_current_season_code()
+    start_year = 2000 + int(season[:2])
+    url = f"{FD_BASE_URL}/{slug}-{start_year}-csv"
+
+    try:
+        text = _fetch_csv(url)
+        df = _parse_csv_text(text)
+    except Exception:
+        return pd.DataFrame()
+
+    # Expected columns: Round Number, Date, Location, Home Team, Away Team, Result
+    if "Home Team" not in df.columns or "Away Team" not in df.columns:
+        return pd.DataFrame()
+
+    # Filter to unplayed matches (Result is empty or NaN)
+    if "Result" in df.columns:
+        unplayed = df["Result"].isna() | (df["Result"].str.strip() == "")
+        df = df[unplayed].copy()
+
+    if df.empty:
+        return pd.DataFrame()
+
+    # Map team names to football-data.co.uk convention
+    df["HomeTeam"] = df["Home Team"].map(lambda t: FD_TEAM_MAP.get(t, t))
+    df["AwayTeam"] = df["Away Team"].map(lambda t: FD_TEAM_MAP.get(t, t))
+
+    # Parse date
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+
+    # Add dummy columns to match football-data format
+    df["FTR"] = ""
+    df["Div"] = league_code
+
+    return df[["Div", "Date", "HomeTeam", "AwayTeam", "FTR"]].reset_index(drop=True)
+
+
 # ---------------------------------------------------------------------------
 # QThread workers for non-blocking GUI downloads
 # ---------------------------------------------------------------------------
@@ -131,6 +182,7 @@ class DownloadWorker(QObject):
 
             # Also download the dedicated fixtures file
             self.progress.emit("Downloading fixtures.csv (all leagues)...")
+            league_fixtures = pd.DataFrame()
             try:
                 fixtures_df = download_fixtures()
                 if "Div" in fixtures_df.columns:
@@ -142,13 +194,26 @@ class DownloadWorker(QObject):
                         f"(from {len(fixtures_df)} total across all leagues)."
                     )
                 else:
-                    league_fixtures = fixtures_df
                     self.progress.emit(
-                        f"  Fixtures: {len(fixtures_df)} rows (no Div column to filter)."
+                        f"  Fixtures: no Div column to filter by."
                     )
             except Exception as e:
                 self.progress.emit(f"  Warning: Could not download fixtures.csv: {e}")
-                league_fixtures = pd.DataFrame()
+
+            # If no fixtures from football-data, try fixturedownload.com backup
+            if league_fixtures.empty:
+                self.progress.emit("Trying fixturedownload.com backup...")
+                try:
+                    fd_fixtures = download_fixtures_fd(self.league_code)
+                    if not fd_fixtures.empty:
+                        league_fixtures = fd_fixtures
+                        self.progress.emit(
+                            f"  Backup: {len(fd_fixtures)} future fixtures from fixturedownload.com"
+                        )
+                    else:
+                        self.progress.emit("  Backup: no fixtures available either.")
+                except Exception as e:
+                    self.progress.emit(f"  Backup failed: {e}")
 
             self.finished.emit({
                 "results": current_df,

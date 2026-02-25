@@ -75,6 +75,12 @@ def clean_results(raw_df: pd.DataFrame) -> pd.DataFrame:
     result["GF"] = pd.to_numeric(df["FTHG"], errors="coerce")
     result["GA"] = pd.to_numeric(df["FTAG"], errors="coerce")
 
+    # Preserve match date for proper gameweek grouping
+    if "Date" in df.columns:
+        result["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+    elif "date" in df.columns:
+        result["Date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
+
     # H → W (home team won), A → L (home team lost), D stays
     result["Result"] = df["FTR"].replace({"H": "W", "A": "L"})
 
@@ -109,6 +115,9 @@ def extract_fixtures(raw_df: pd.DataFrame) -> pd.DataFrame:
     Handles both formats:
     - Season CSV: has FTR column, fixtures are rows where FTR is empty
     - Dedicated fixtures.csv: may not have FTR at all, all rows are fixtures
+
+    Prefers future-dated matches, but falls back to all unresulted matches
+    if no future fixtures exist yet (e.g. when results haven't been updated).
     """
     if raw_df.empty:
         return pd.DataFrame(columns=["Team", "Opponent"])
@@ -131,9 +140,36 @@ def extract_fixtures(raw_df: pd.DataFrame) -> pd.DataFrame:
     mask &= raw_df[away_col].notna()
     df = raw_df.loc[mask].copy()
 
+    # Try to filter to future-only matches
+    date_col = None
+    for col in ("Date", "date"):
+        if col in df.columns:
+            date_col = col
+            break
+
+    is_future_only = False
+    if date_col is not None:
+        dates = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
+        tomorrow = pd.Timestamp.now().normalize() + pd.Timedelta(days=1)
+        future_mask = dates.isna() | (dates >= tomorrow)
+        future_df = df.loc[future_mask]
+
+        if len(future_df) > 0:
+            # We have genuine future fixtures — use only those
+            df = future_df
+            is_future_only = True
+        # else: no future fixtures yet, keep all unresulted as fallback
+
     result = pd.DataFrame()
     result["Team"] = df[home_col].values
     result["Opponent"] = df[away_col].values
+
+    # Preserve date for display
+    if date_col is not None and date_col in df.columns:
+        result["Date"] = pd.to_datetime(df[date_col].values, dayfirst=True, errors="coerce")
+
+    # Flag whether these are confirmed future or possibly already played
+    result["_future_only"] = is_future_only
 
     # Bet365 odds
     for src, dst in [("B365H", "Home_Odds"), ("B365D", "Draw_Odds"), ("B365A", "Away_Odds")]:
@@ -235,6 +271,56 @@ def combine_seasons(season_data: list[tuple[str, pd.DataFrame]]) -> pd.DataFrame
     return pd.concat(all_results, ignore_index=True)
 
 
+def assign_gameweeks(results_df: pd.DataFrame, max_gap_days: int = 4) -> pd.Series:
+    """Assign gameweek numbers based on Friday-to-Thursday calendar weeks.
+
+    All matches from Friday 00:00 to Thursday 23:59 belong to the same
+    gameweek. This naturally groups weekend + midweek fixtures together,
+    meaning a double-header week could have 13+ games — the system handles
+    this by allowing variable-size gameweeks.
+
+    If no Date column exists, falls back to chunking by n_teams/2.
+
+    Returns a Series of gameweek numbers (1-indexed) aligned with results_df index.
+    """
+    if "Date" not in results_df.columns or results_df["Date"].isna().all():
+        # Fallback: chunk by number of teams
+        teams = set(results_df["Team"].unique()) | set(results_df["Opponent"].unique())
+        gpw = max(len(teams) // 2, 1)
+        return pd.Series(
+            [i // gpw + 1 for i in range(len(results_df))],
+            index=results_df.index,
+        )
+
+    dates = pd.to_datetime(results_df["Date"], errors="coerce")
+
+    # Convert each date to its Friday-Thursday week number.
+    # Friday = weekday 4. Shifting by 3 days maps Fri→Mon of that week,
+    # so all days Fri-Thu get the same isocalendar week.
+    shifted = dates - pd.Timedelta(days=4)  # Fri→Mon, Sat→Tue, ..., Thu→Sun
+    # Use (year, week) tuples as grouping keys
+    week_keys = shifted.apply(
+        lambda d: (d.isocalendar()[0], d.isocalendar()[1]) if pd.notna(d) else None
+    )
+
+    # Assign sequential gameweek numbers
+    gw_labels = pd.Series(0, index=results_df.index, dtype=int)
+    seen_weeks: dict = {}
+    current_gw = 0
+
+    for idx in results_df.index:
+        wk = week_keys[idx]
+        if wk is None:
+            gw_labels[idx] = current_gw if current_gw > 0 else 1
+            continue
+        if wk not in seen_weeks:
+            current_gw += 1
+            seen_weeks[wk] = current_gw
+        gw_labels[idx] = seen_weeks[wk]
+
+    return gw_labels
+
+
 def save_workbook(results_df: pd.DataFrame, fixtures_df: pd.DataFrame,
                   league_table_df: pd.DataFrame, path: str,
                   backtest_results_df: pd.DataFrame | None = None):
@@ -283,7 +369,8 @@ def process_and_save(raw_df: pd.DataFrame, fixtures_raw_df: pd.DataFrame | None,
         backtest_df = combine_seasons(season_data)
         n_seasons = len(season_data)
 
-    save_workbook(results, fixtures, table, output_path, backtest_df)
+    save_workbook(results, fixtures.drop(columns=["_future_only"], errors="ignore"),
+                 table, output_path, backtest_df)
 
     return {
         "results_count": len(results),

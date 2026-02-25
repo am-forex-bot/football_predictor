@@ -114,9 +114,9 @@ class TunerTab(QWidget):
         info_group = QGroupBox("Overfitting Protection")
         info_layout = QVBoxLayout(info_group)
         info_label = QLabel(
-            "Training uses first 70% of matches, validation uses last 30%. "
-            "Candidates ranked by blended accuracy (40% train + 60% validation) "
-            "to prevent overfitting to historical data."
+            "Multi-season walk-forward validation: trains on earlier seasons, "
+            "validates on the most recent 2 seasons. Single-season falls back "
+            "to 70/30 split. Ranked by blended accuracy (40% train + 60% validation)."
         )
         info_label.setWordWrap(True)
         info_layout.addWidget(info_label)
@@ -172,19 +172,29 @@ class TunerTab(QWidget):
             self.main_window.set_status("No league selected")
             return
 
-        data = load_league_data(code)
-        if data is None:
-            self.main_window.set_status("No data available for this league")
-            return
+        # Try multi-season backtest data first, fall back to single season
+        from core.data_manager import load_backtest_data, load_league_data
+        results_df = load_backtest_data(code)
+        table_df = None
 
-        results_df, _, table_df = data
+        if results_df is None or results_df.empty:
+            data = load_league_data(code)
+            if data is None:
+                self.main_window.set_status("No data available for this league")
+                return
+            results_df, _, table_df = data
+
         n_candidates = self.candidates_spin.value()
 
         self.run_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, n_candidates)
         self.progress_bar.setValue(0)
-        self.main_window.set_status(f"Tuning weights (0/{n_candidates})...")
+
+        n_seasons = results_df["Season"].nunique() if "Season" in results_df.columns else 1
+        self.main_window.set_status(
+            f"Tuning weights across {n_seasons} season(s) (0/{n_candidates})..."
+        )
 
         self._thread = QThread()
         self._worker = _TunerWorker(
@@ -273,6 +283,7 @@ class TunerTab(QWidget):
                      f"Threshold: {best_config['threshold']}",
                      f"Heavy loss penalty: {best_config['loss_heavy_penalty']}",
                      f"Heavy loss GD threshold: {best_config['heavy_loss_gd']}",
+                     f"Big win GD threshold: {best_config.get('big_win_gd', 3)}",
                      "",
                      "Win Weights:"]
             for venue in ["Home", "Away"]:
@@ -280,6 +291,13 @@ class TunerTab(QWidget):
                 lines.append(f"  {venue}: " + "  ".join(
                     f"{t}={v:.1f}" for t, v in w.items()
                 ))
+            lines.append("\nBig Win Bonus:")
+            for venue in ["Home", "Away"]:
+                w = best_config.get("big_win_bonus", {}).get(venue, {})
+                if w:
+                    lines.append(f"  {venue}: " + "  ".join(
+                        f"{t}={v:.1f}" for t, v in w.items()
+                    ))
             lines.append("\nDraw Weights:")
             for venue in ["Home", "Away"]:
                 w = best_config["draw_weights"][venue]
@@ -297,6 +315,14 @@ class TunerTab(QWidget):
         self.main_window.set_status(
             f"Tuning complete. Best blended accuracy: {top['blended_acc']:.1f}%"
         )
+
+        # Store on main_window so backtest tab can use it
+        if best_config:
+            self.main_window.tuned_config = best_config
+            self.main_window.set_status(
+                f"Tuning complete — blended {top['blended_acc']:.1f}%. "
+                f"Tick 'Use Tuned Weights' in Backtest tab to apply."
+            )
 
     def _on_error(self, msg: str):
         self.run_btn.setEnabled(True)

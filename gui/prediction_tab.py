@@ -24,37 +24,63 @@ class PredictionTab(QWidget):
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
-        layout.setSpacing(12)
+        layout.setSpacing(8)
 
         # --- Configuration ---
         config_group = QGroupBox("Configuration")
         config_layout = QHBoxLayout(config_group)
+        config_layout.setSpacing(6)
+
+        from PyQt6.QtWidgets import QCheckBox
 
         config_layout.addWidget(QLabel("League:"))
         self.league_combo = QComboBox()
-        self.league_combo.setMinimumWidth(220)
+        self.league_combo.setMinimumWidth(180)
         config_layout.addWidget(self.league_combo)
 
-        config_layout.addWidget(QLabel("Threshold:"))
+        config_layout.addWidget(QLabel("  Threshold:"))
         self.threshold_spin = QDoubleSpinBox()
         self.threshold_spin.setRange(0.5, 20.0)
         self.threshold_spin.setSingleStep(0.5)
         self.threshold_spin.setValue(3.0)
         self.threshold_spin.setDecimals(1)
+        self.threshold_spin.setMinimumWidth(60)
         config_layout.addWidget(self.threshold_spin)
 
-        config_layout.addWidget(QLabel("Lookback:"))
+        config_layout.addWidget(QLabel("  Lookback:"))
         self.lookback_spin = QSpinBox()
         self.lookback_spin.setRange(3, 20)
         self.lookback_spin.setValue(6)
+        self.lookback_spin.setMinimumWidth(50)
         config_layout.addWidget(self.lookback_spin)
+
+        config_layout.addWidget(QLabel("  No-bet band:"))
+        self.no_bet_spin = QDoubleSpinBox()
+        self.no_bet_spin.setRange(0.0, 10.0)
+        self.no_bet_spin.setSingleStep(0.5)
+        self.no_bet_spin.setValue(0.0)
+        self.no_bet_spin.setDecimals(1)
+        self.no_bet_spin.setMinimumWidth(60)
+        self.no_bet_spin.setToolTip(
+            "Skip matches where the score diff is too close to call.\n"
+            "0.0 = predict everything. Higher = fewer but stronger picks."
+        )
+        config_layout.addWidget(self.no_bet_spin)
+
+        self.use_tuned_check = QCheckBox("Tuned Weights")
+        self.use_tuned_check.setToolTip(
+            "Use weights from the Tune Weights tab.\n"
+            "Run the weight tuner first, then check this box."
+        )
+        config_layout.addWidget(self.use_tuned_check)
+
+        config_layout.addStretch()
 
         self.run_btn = QPushButton("Run Predictions")
         self.run_btn.setProperty("success", True)
         self.run_btn.clicked.connect(self._on_run)
         config_layout.addWidget(self.run_btn)
 
-        config_layout.addStretch()
         layout.addWidget(config_group)
 
         # --- Results table ---
@@ -63,16 +89,16 @@ class PredictionTab(QWidget):
 
         self.results_table = QTableWidget()
         cols = [
-            "Home Team", "Cat", "Away Team", "Cat", "Prediction", "Score Diff",
+            "Date", "Home Team", "Cat", "Away Team", "Cat", "Prediction", "Score Diff",
             "B365 Odds", "Implied %", "Potential (£10)", "Acca Leg",
         ]
         self.results_table.setColumnCount(len(cols))
         self.results_table.setHorizontalHeaderLabels(cols)
         self.results_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch
+            1, QHeaderView.ResizeMode.Stretch
         )
         self.results_table.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.ResizeMode.Stretch
+            3, QHeaderView.ResizeMode.Stretch
         )
         self.results_table.setAlternatingRowColors(True)
         self.results_table.setSortingEnabled(True)
@@ -115,15 +141,37 @@ class PredictionTab(QWidget):
 
         if fixtures_df.empty:
             self.main_window.set_status(
-                "No fixtures found! Re-download the league to fetch fixtures.csv"
+                "No upcoming fixtures found! Try re-downloading after results are updated."
             )
             self.summary_label.setText(
-                "No fixtures available. The season CSV may not contain upcoming matches. "
-                "Try re-downloading — the app now also fetches the dedicated fixtures.csv."
+                "No future fixtures available. This usually means football-data.co.uk "
+                "hasn't updated yet after today's matches. Try re-downloading tomorrow, "
+                "or wait for the site to publish next week's fixtures."
             )
             return
 
-        cfg = PredictorConfig(lookback=lookback, threshold=threshold)
+        cfg = PredictorConfig(lookback=lookback, threshold=threshold,
+                              no_bet_band=self.no_bet_spin.value())
+
+        # Apply tuned weights if checked
+        if self.use_tuned_check.isChecked():
+            tuned = getattr(self.main_window, "tuned_config", None)
+            if tuned:
+                cfg = PredictorConfig(
+                    lookback=lookback,
+                    threshold=threshold,
+                    no_bet_band=self.no_bet_spin.value(),
+                    win_weights=tuned.get("win_weights", cfg.win_weights),
+                    draw_weights=tuned.get("draw_weights", cfg.draw_weights),
+                    loss_close_weights=tuned.get("loss_close_weights",
+                                                  cfg.loss_close_weights),
+                    loss_heavy_penalty=tuned.get("loss_heavy_penalty",
+                                                  cfg.loss_heavy_penalty),
+                    heavy_loss_gd=tuned.get("heavy_loss_gd", cfg.heavy_loss_gd),
+                    big_win_bonus=tuned.get("big_win_bonus", cfg.big_win_bonus),
+                    big_win_gd=tuned.get("big_win_gd", cfg.big_win_gd),
+                )
+
         predictor = MatchPredictor(cfg)
         predictions = predictor.predict_fixtures(results_df, table_df, fixtures_df)
 
@@ -151,15 +199,20 @@ class PredictionTab(QWidget):
         acca_legs = 0
 
         for row, p in enumerate(predictions):
-            self.results_table.setItem(row, 0, QTableWidgetItem(p["home_team"]))
-            self.results_table.setItem(row, 1, QTableWidgetItem(p.get("home_cat", "")))
-            self.results_table.setItem(row, 2, QTableWidgetItem(p["away_team"]))
-            self.results_table.setItem(row, 3, QTableWidgetItem(p.get("away_cat", "")))
-            self.results_table.setItem(row, 4, QTableWidgetItem(p["prediction"]))
+            # Date
+            fix_date = p.get("date")
+            date_str = fix_date.strftime("%a %d %b") if fix_date else "-"
+            self.results_table.setItem(row, 0, QTableWidgetItem(date_str))
+
+            self.results_table.setItem(row, 1, QTableWidgetItem(p["home_team"]))
+            self.results_table.setItem(row, 2, QTableWidgetItem(p.get("home_cat", "")))
+            self.results_table.setItem(row, 3, QTableWidgetItem(p["away_team"]))
+            self.results_table.setItem(row, 4, QTableWidgetItem(p.get("away_cat", "")))
+            self.results_table.setItem(row, 5, QTableWidgetItem(p["prediction"]))
 
             diff_item = QTableWidgetItem()
             diff_item.setData(Qt.ItemDataRole.DisplayRole, p["score_diff"])
-            self.results_table.setItem(row, 5, diff_item)
+            self.results_table.setItem(row, 6, diff_item)
 
             pred_odds = p.get("pred_odds")
             implied = p.get("implied_prob")
@@ -171,7 +224,7 @@ class PredictionTab(QWidget):
                 odds_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             else:
                 odds_item = QTableWidgetItem("-")
-            self.results_table.setItem(row, 6, odds_item)
+            self.results_table.setItem(row, 7, odds_item)
 
             # Implied probability from B365 odds
             if implied:
@@ -183,7 +236,7 @@ class PredictionTab(QWidget):
                     imp_item.setForeground(QColor("#f59e0b"))
             else:
                 imp_item = QTableWidgetItem("-")
-            self.results_table.setItem(row, 7, imp_item)
+            self.results_table.setItem(row, 8, imp_item)
 
             # Track wins/draws/no bets
             if "Win" in pred_text and pred_text.startswith(p["home_team"]):
@@ -204,7 +257,7 @@ class PredictionTab(QWidget):
                 acca_legs += 1
             else:
                 pot_item = QTableWidgetItem("-")
-            self.results_table.setItem(row, 8, pot_item)
+            self.results_table.setItem(row, 9, pot_item)
 
             # Acca running odds
             if pred_odds and pred_text != "No Bet":
@@ -213,7 +266,7 @@ class PredictionTab(QWidget):
                 acca_item.setForeground(QColor("#fbbf24"))
             else:
                 acca_item = QTableWidgetItem("-")
-            self.results_table.setItem(row, 9, acca_item)
+            self.results_table.setItem(row, 10, acca_item)
 
             # Color code rows
             if "Win" in pred_text and pred_text.startswith(p["home_team"]):
