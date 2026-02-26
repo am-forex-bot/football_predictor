@@ -155,6 +155,78 @@ def closing_line_value(bet_odds: float, closing_odds: float) -> float:
 
 
 # ───────────────────────────────────────────────────────────────────────
+# Overround & fair odds utilities
+# ───────────────────────────────────────────────────────────────────────
+
+def calculate_overround(home_odds: float, draw_odds: float, away_odds: float) -> float:
+    """Calculate the bookmaker's overround (margin) as a percentage.
+
+    A perfectly fair market has overround = 0%.
+    Typical bookmaker overround is 5-12%.
+    Pinnacle is usually 2-3%.
+    """
+    return (odds_to_prob(home_odds) + odds_to_prob(draw_odds) + odds_to_prob(away_odds) - 1.0) * 100
+
+
+def fair_odds(odds: float, overround: float) -> float:
+    """Convert bookmaker odds to fair odds by removing overround.
+
+    fair_odds are always >= bookmaker odds (better for the punter).
+    """
+    if odds <= 1.0 or overround <= 0:
+        return odds
+    implied = odds_to_prob(odds)
+    fair_prob = implied / (1.0 + overround / 100.0)
+    if fair_prob <= 0:
+        return odds
+    return 1.0 / fair_prob
+
+
+def value_summary(value_bets: List[dict]) -> dict:
+    """Summarise a list of value bets into an actionable overview.
+
+    Returns a dict with:
+    - total_bets: number of value bets found
+    - total_stake: sum of Kelly stakes
+    - total_ev: sum of expected values
+    - avg_edge: average edge percentage
+    - by_confidence: {HIGH: n, MEDIUM: n, LOW: n}
+    - by_market: {1X2: n, O/U 2.5: n, BTTS: n}
+    - best_bet: the single highest-EV bet (or None)
+    """
+    if not value_bets:
+        return {
+            "total_bets": 0, "total_stake": 0, "total_ev": 0,
+            "avg_edge": 0, "by_confidence": {}, "by_market": {},
+            "best_bet": None,
+        }
+
+    total_stake = sum(b["kelly_stake"] for b in value_bets)
+    total_ev = sum(b["expected_value"] for b in value_bets)
+    avg_edge = sum(b["edge"] for b in value_bets) / len(value_bets)
+
+    by_conf: Dict[str, int] = {}
+    by_market: Dict[str, int] = {}
+    for b in value_bets:
+        c = b.get("confidence", "LOW")
+        by_conf[c] = by_conf.get(c, 0) + 1
+        m = b["market"]
+        by_market[m] = by_market.get(m, 0) + 1
+
+    best = max(value_bets, key=lambda x: x["expected_value"])
+
+    return {
+        "total_bets": len(value_bets),
+        "total_stake": round(total_stake, 2),
+        "total_ev": round(total_ev, 2),
+        "avg_edge": round(avg_edge, 1),
+        "by_confidence": by_conf,
+        "by_market": by_market,
+        "best_bet": best,
+    }
+
+
+# ───────────────────────────────────────────────────────────────────────
 # Value betting engine
 # ───────────────────────────────────────────────────────────────────────
 
@@ -196,7 +268,7 @@ class ValueEngine:
                         fixtures_df: pd.DataFrame) -> list[dict]:
         """Find all value bets for upcoming fixtures.
 
-        Returns list of value bet opportunities sorted by edge (best first).
+        Returns list of value bet opportunities sorted by expected value (best first).
         Each entry includes all markets (1X2, O/U 2.5, BTTS).
 
         Also stores all predictions (with or without odds) in self.last_predictions
@@ -214,17 +286,31 @@ class ValueEngine:
             match_bets = self._evaluate_match(pred, cfg)
             value_bets.extend(match_bets)
 
-        # Sort by edge descending
-        value_bets.sort(key=lambda x: x["edge"], reverse=True)
+        # Sort by expected value descending (EV is what matters, not just edge)
+        value_bets.sort(key=lambda x: x["expected_value"], reverse=True)
         return value_bets
 
     def _evaluate_match(self, pred: dict, cfg: BankrollConfig) -> list[dict]:
-        """Evaluate all markets for a single match."""
+        """Evaluate all markets for a single match.
+
+        Returns value bets with confidence ratings:
+        - HIGH: edge >= 10% and model prob > 50%
+        - MEDIUM: edge >= 5% or model prob > 40%
+        - LOW: everything else that meets minimum edge
+        """
         bets = []
 
         home = pred["home_team"]
         away = pred["away_team"]
         date = pred.get("date")
+
+        def _rate_confidence(edge: float, model_prob: float) -> str:
+            """Rate confidence in a value bet."""
+            if edge >= 0.10 and model_prob > 0.50:
+                return "HIGH"
+            elif edge >= 0.05 or model_prob > 0.40:
+                return "MEDIUM"
+            return "LOW"
 
         # ── 1X2 Market ────────────────────────────────────────────────
         markets_1x2 = [
@@ -266,7 +352,7 @@ class ValueEngine:
                 "expected_value": round(ev, 2),
                 "home_xg": pred["home_xg"],
                 "away_xg": pred["away_xg"],
-                "confidence": round(model_prob * 100, 1),
+                "confidence": _rate_confidence(edge, model_prob),
             })
 
         # ── Over/Under 2.5 Market ────────────────────────────────────
@@ -304,7 +390,7 @@ class ValueEngine:
                 "expected_value": round(ev, 2),
                 "home_xg": pred["home_xg"],
                 "away_xg": pred["away_xg"],
-                "confidence": round(model_prob * 100, 1),
+                "confidence": _rate_confidence(edge, model_prob),
             })
 
         # ── BTTS Market ──────────────────────────────────────────────
@@ -342,7 +428,7 @@ class ValueEngine:
                 "expected_value": round(ev, 2),
                 "home_xg": pred["home_xg"],
                 "away_xg": pred["away_xg"],
-                "confidence": round(model_prob * 100, 1),
+                "confidence": _rate_confidence(edge, model_prob),
             })
 
         return bets

@@ -8,11 +8,15 @@ Get your free API key at: https://the-odds-api.com
 """
 
 import json
+import logging
 import os
 from typing import Optional
+from urllib.parse import urlencode
 
 import pandas as pd
 import requests
+
+log = logging.getLogger(__name__)
 
 # ───────────────────────────────────────────────────────────────────────
 # League code → the-odds-api sport key
@@ -44,7 +48,7 @@ LEAGUE_TO_SPORT = {
 # ───────────────────────────────────────────────────────────────────────
 
 _TEAM_MAP = {
-    # England
+    # England — Premier League (the-odds-api name → football-data.co.uk name)
     "Manchester City": "Man City",
     "Manchester United": "Man United",
     "Nottingham Forest": "Nott'm Forest",
@@ -57,11 +61,17 @@ _TEAM_MAP = {
     "Ipswich Town": "Ipswich",
     "Sheffield United": "Sheffield United",
     "Luton Town": "Luton",
+    "Southampton": "Southampton",
+    "Bournemouth": "Bournemouth",
+    "AFC Bournemouth": "Bournemouth",
+    # England — Championship / lower leagues
     "Leeds United": "Leeds",
     "Norwich City": "Norwich",
     "Coventry City": "Coventry",
     "Middlesbrough FC": "Middlesbrough",
+    "Middlesbrough": "Middlesbrough",
     "Sunderland AFC": "Sunderland",
+    "Sunderland": "Sunderland",
     "Blackburn Rovers": "Blackburn",
     "Queens Park Rangers": "QPR",
     "Stoke City": "Stoke",
@@ -75,6 +85,14 @@ _TEAM_MAP = {
     "Huddersfield Town": "Huddersfield",
     "Birmingham City": "Birmingham",
     "Watford FC": "Watford",
+    "Watford": "Watford",
+    "Burnley FC": "Burnley",
+    "Burnley": "Burnley",
+    "Sheffield Wednesday": "Sheffield Weds",
+    "Derby County": "Derby",
+    "Oxford United": "Oxford",
+    "Portsmouth FC": "Portsmouth",
+    "Portsmouth": "Portsmouth",
     # Germany
     "Bayern Munich": "Bayern Munich",
     "Borussia Dortmund": "Dortmund",
@@ -222,21 +240,47 @@ _TEAM_MAP = {
 
 def _normalise(name: str) -> str:
     """Normalise a team name for fuzzy matching."""
-    n = name.lower().strip()
+    import unicodedata
+    # Decompose accented characters → base + combining, then strip combining
+    n = unicodedata.normalize("NFKD", name)
+    n = "".join(c for c in n if not unicodedata.combining(c))
+    n = n.lower().strip()
     # Strip common suffixes
-    for suffix in (" fc", " cf", " afc", " sc", " sv", " 1848", " 1846",
-                   " 1913", " 1919", " calcio"):
+    for suffix in (" fc", " cf", " afc", " sc", " sv", " ssd",
+                   " 1848", " 1846", " 1910", " 1909", " 1913", " 1919",
+                   " calcio", " de futbol", " balompie"):
         n = n.removesuffix(suffix)
+    # Strip common prefixes
+    for prefix in ("afc ", "fc ", "1. ", "rc ", "rcd ", "us ", "ss ",
+                   "ssc ", "ud ", "cd ", "ac ", "as "):
+        if n.startswith(prefix):
+            n = n[len(prefix):]
     return n.strip()
 
 
 def _match_team(odds_name: str, fd_names: list[str]) -> Optional[str]:
-    """Match an odds-api team name to the closest football-data name."""
-    # 1. Direct map
+    """Match an odds-api team name to the closest football-data name.
+
+    Uses a multi-pass approach:
+    1. Direct map lookup (hard-coded known mappings)
+    2. Exact match (already in the right format)
+    3. Case-insensitive match
+    4. Normalised exact match (strips suffixes, accents, etc.)
+    5. Normalised substring match (one name contains the other)
+    6. Word-overlap match (shares significant words)
+    """
+    if not odds_name or not fd_names:
+        return None
+
+    # 1. Direct map — check the mapped value is actually in our fixture list
     if odds_name in _TEAM_MAP:
         mapped = _TEAM_MAP[odds_name]
         if mapped in fd_names:
             return mapped
+        # The mapped name might itself need case-insensitive matching
+        lower_map = {n.lower(): n for n in fd_names}
+        if mapped.lower() in lower_map:
+            return lower_map[mapped.lower()]
 
     # 2. Exact match (already in fd format)
     if odds_name in fd_names:
@@ -247,14 +291,36 @@ def _match_team(odds_name: str, fd_names: list[str]) -> Optional[str]:
     if odds_name.lower() in lower_map:
         return lower_map[odds_name.lower()]
 
-    # 4. Normalised substring match
+    # 4. Normalised exact match
     norm_odds = _normalise(odds_name)
+    norm_lookup = {_normalise(n): n for n in fd_names}
+    if norm_odds in norm_lookup:
+        return norm_lookup[norm_odds]
+
+    # 5. Normalised substring match
     for fd_name in fd_names:
         norm_fd = _normalise(fd_name)
-        if norm_odds == norm_fd:
-            return fd_name
-        if norm_odds in norm_fd or norm_fd in norm_odds:
-            return fd_name
+        if len(norm_odds) >= 3 and len(norm_fd) >= 3:
+            if norm_odds in norm_fd or norm_fd in norm_odds:
+                return fd_name
+
+    # 6. Word-overlap match — if the significant words overlap
+    odds_words = set(norm_odds.split()) - {"de", "la", "the", "of", "and", "city", "united", "town"}
+    if odds_words:
+        best_match = None
+        best_overlap = 0
+        for fd_name in fd_names:
+            fd_words = set(_normalise(fd_name).split()) - {"de", "la", "the", "of", "and", "city", "united", "town"}
+            if not fd_words:
+                continue
+            overlap = len(odds_words & fd_words)
+            # Require at least one significant word overlap and > 50% match
+            min_len = min(len(odds_words), len(fd_words))
+            if overlap > best_overlap and overlap >= 1 and overlap / min_len >= 0.5:
+                best_overlap = overlap
+                best_match = fd_name
+        if best_match and best_overlap >= 1:
+            return best_match
 
     return None
 
@@ -364,17 +430,30 @@ def fetch_odds(league_code: str, api_key: str,
         )
 
     bm_key = BOOKMAKERS.get(bookmaker, bookmaker)
-
-    # Build URL with literal commas — Python requests percent-encodes
-    # commas (%2C) which the-odds-api doesn't decode properly.
     key = api_key.strip()
+
+    # CRITICAL: the-odds-api requires literal commas in query parameters.
+    # Python's requests library percent-encodes commas (%2C) which breaks
+    # the API — it treats "h2h%2Ctotals" as a single unknown market and
+    # returns events with zero bookmaker data.
+    #
+    # Fix: use requests.Request + PreparedRequest to set the exact URL
+    # with literal commas, bypassing the param encoder entirely.
     url = (
         f"{_BASE}/sports/{sport}/odds/"
-        f"?apiKey={key}&regions=uk,eu"
-        f"&markets=h2h,totals&oddsFormat=decimal"
+        f"?apiKey={key}"
+        f"&regions=uk,eu"
+        f"&markets=h2h,totals"
+        f"&oddsFormat=decimal"
     )
+    req = requests.Request("GET", url)
+    prepared = req.prepare()
+    # Overwrite the URL to preserve literal commas (prepare() may re-encode)
+    prepared.url = url
 
-    resp = requests.get(url, timeout=15)
+    session = requests.Session()
+    resp = session.send(prepared, timeout=15)
+    log.info("Odds API %s → %s (%s bytes)", sport, resp.status_code, len(resp.content))
 
     if resp.status_code == 401:
         raise ValueError("Invalid API key. Check your key at https://the-odds-api.com")
@@ -389,6 +468,13 @@ def fetch_odds(league_code: str, api_key: str,
     remaining = resp.headers.get("x-requests-remaining", "?")
     used = resp.headers.get("x-requests-used", "?")
 
+    log.info("Odds API returned %d events, remaining=%s", len(data), remaining)
+    if data:
+        sample = data[0]
+        n_bm = len(sample.get("bookmakers", []))
+        log.info("  First event: %s vs %s, %d bookmakers",
+                 sample.get("home_team"), sample.get("away_team"), n_bm)
+
     # Try target bookmaker first; fall back to best available
     odds = _parse_odds(data, bm_key)
     source = bookmaker
@@ -398,6 +484,8 @@ def fetch_odds(league_code: str, api_key: str,
         odds = _parse_odds(data, "")
         if odds:
             source = "best available (target bookmaker not found)"
+
+    log.info("Parsed %d fixtures with odds (source: %s)", len(odds), source)
 
     return {
         "odds": odds,
@@ -497,6 +585,10 @@ def merge_odds_into_fixtures(fixtures_df: pd.DataFrame,
     - Home_Odds, Draw_Odds, Away_Odds (1X2)
     - Max_Home_Odds etc. (set same as above for single-bookmaker mode)
     - Over_25_Odds, Under_25_Odds (totals)
+
+    Handles both column conventions:
+    - Team/Opponent (cleaned format from workbook)
+    - HomeTeam/AwayTeam (raw format from download)
     """
     if fixtures_df.empty or not odds_data:
         return fixtures_df
@@ -509,15 +601,32 @@ def merge_odds_into_fixtures(fixtures_df: pd.DataFrame,
     elif "HomeTeam" in df.columns:
         home_col, away_col = "HomeTeam", "AwayTeam"
     else:
+        log.warning("merge_odds: no Team or HomeTeam column found in fixtures")
         return df
 
     # Get all fixture team names for matching
-    fd_names = list(set(df[home_col].tolist() + df[away_col].tolist()))
+    fd_names = list(set(
+        df[home_col].dropna().tolist() + df[away_col].dropna().tolist()
+    ))
+
+    log.info("merge_odds: %d odds entries, %d fixtures, %d unique teams",
+             len(odds_data), len(df), len(fd_names))
 
     # Remap odds team names to football-data names
+    unmatched = []
     for o in odds_data:
-        o["home_team"] = _match_team(o["home_team_raw"], fd_names) or o["home_team_raw"]
-        o["away_team"] = _match_team(o["away_team_raw"], fd_names) or o["away_team_raw"]
+        h = _match_team(o["home_team_raw"], fd_names)
+        a = _match_team(o["away_team_raw"], fd_names)
+        if not h:
+            unmatched.append(o["home_team_raw"])
+        if not a:
+            unmatched.append(o["away_team_raw"])
+        o["home_team"] = h or o["home_team_raw"]
+        o["away_team"] = a or o["away_team_raw"]
+
+    if unmatched:
+        log.warning("merge_odds: %d team names not matched: %s",
+                    len(unmatched), unmatched[:10])
 
     # Build lookup: (home, away) → odds dict
     odds_lookup = {}
@@ -560,4 +669,5 @@ def merge_odds_into_fixtures(fixtures_df: pd.DataFrame,
         if o.get("under_25_odds"):
             df.at[idx, "Under_25_Odds"] = o["under_25_odds"]
 
+    log.info("merge_odds: matched %d / %d fixtures", matched, len(df))
     return df

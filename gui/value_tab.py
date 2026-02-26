@@ -18,7 +18,7 @@ from core.data_manager import get_available_leagues, load_league_data
 from core.poisson_model import PoissonModel, PoissonConfig
 from core.value_engine import (
     ValueEngine, BankrollConfig, odds_to_prob, calculate_edge,
-    kelly_stake, expected_value,
+    kelly_stake, expected_value, value_summary, calculate_overround,
 )
 from core.odds_provider import (
     fetch_odds, merge_odds_into_fixtures, get_sport_key,
@@ -252,6 +252,7 @@ class ValueTab(QWidget):
         cols = [
             "Match", "Market", "Selection", "Model %", "Implied %",
             "Edge %", "Best Odds", "Kelly Stake", "EV (£)", "xG",
+            "Confidence",
         ]
         self.vb_table.setColumnCount(len(cols))
         self.vb_table.setHorizontalHeaderLabels(cols)
@@ -276,7 +277,7 @@ class ValueTab(QWidget):
         self.prob_table = QTableWidget()
         cols = [
             "Match", "Home xG", "Away xG", "P(Home)", "P(Draw)", "P(Away)",
-            "P(O2.5)", "P(BTTS)", "Top Score",
+            "P(O2.5)", "P(BTTS)", "Top Score", "Overround",
         ]
         self.prob_table.setColumnCount(len(cols))
         self.prob_table.setHorizontalHeaderLabels(cols)
@@ -465,7 +466,12 @@ class ValueTab(QWidget):
 
     def _fetch_live_odds(self, league_code: str,
                          fixtures_df: pd.DataFrame) -> pd.DataFrame:
-        """Fetch live odds and merge into fixtures. Returns updated df."""
+        """Fetch live odds and merge into fixtures. Returns updated df.
+
+        If the existing fixtures_df is empty but we get odds from the API,
+        we create fixture rows directly from the odds data so the model
+        can still predict those matches.
+        """
         api_key = self.api_key_edit.text().strip()
         if not api_key:
             self.odds_status.setText("No API key — skipping live odds")
@@ -505,14 +511,59 @@ class ValueTab(QWidget):
                 self.odds_status.setStyleSheet("color: #fbbf24; font-size: 11px;")
                 return fixtures_df
 
-            # Merge odds into fixtures
-            updated = merge_odds_into_fixtures(fixtures_df, odds_data)
-
-            # Count how many fixtures got odds
-            if "Home_Odds" in updated.columns:
-                n_with_odds = int(updated["Home_Odds"].notna().sum())
+            # If we have no fixtures at all, create them from odds data.
+            # This is the key fallback: the odds API gives us the fixture
+            # list AND the odds in one shot.
+            if fixtures_df.empty:
+                from core.odds_provider import _match_team, _TEAM_MAP
+                rows = []
+                for o in odds_data:
+                    rows.append({
+                        "Team": o["home_team_raw"],
+                        "Opponent": o["away_team_raw"],
+                        "Date": o.get("commence_time", ""),
+                        "Home_Odds": o["home_odds"],
+                        "Draw_Odds": o["draw_odds"],
+                        "Away_Odds": o["away_odds"],
+                        "Max_Home_Odds": o["home_odds"],
+                        "Max_Draw_Odds": o["draw_odds"],
+                        "Max_Away_Odds": o["away_odds"],
+                        "Over_25_Odds": o.get("over_25_odds"),
+                        "Under_25_Odds": o.get("under_25_odds"),
+                    })
+                updated = pd.DataFrame(rows)
+                n_with_odds = len(rows)
             else:
-                n_with_odds = 0
+                # Merge odds into existing fixtures
+                updated = merge_odds_into_fixtures(fixtures_df, odds_data)
+
+                # Count how many fixtures got odds
+                if "Home_Odds" in updated.columns:
+                    n_with_odds = int(updated["Home_Odds"].notna().sum())
+                else:
+                    n_with_odds = 0
+
+                # If merge matched nothing, try creating from odds data
+                # and appending to the existing fixtures
+                if n_with_odds == 0:
+                    rows = []
+                    for o in odds_data:
+                        rows.append({
+                            "Team": o["home_team_raw"],
+                            "Opponent": o["away_team_raw"],
+                            "Date": o.get("commence_time", ""),
+                            "Home_Odds": o["home_odds"],
+                            "Draw_Odds": o["draw_odds"],
+                            "Away_Odds": o["away_odds"],
+                            "Max_Home_Odds": o["home_odds"],
+                            "Max_Draw_Odds": o["draw_odds"],
+                            "Max_Away_Odds": o["away_odds"],
+                            "Over_25_Odds": o.get("over_25_odds"),
+                            "Under_25_Odds": o.get("under_25_odds"),
+                        })
+                    odds_fixtures = pd.DataFrame(rows)
+                    updated = pd.concat([updated, odds_fixtures], ignore_index=True)
+                    n_with_odds = len(rows)
 
             # Build status message
             parts = [f"{len(odds_data)} fixtures with odds"]
@@ -704,6 +755,18 @@ class ValueTab(QWidget):
             xg_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.vb_table.setItem(row, 9, xg_item)
 
+            # Confidence rating
+            conf = b.get("confidence", "LOW")
+            conf_item = QTableWidgetItem(conf)
+            conf_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if conf == "HIGH":
+                conf_item.setForeground(QColor("#22c55e"))
+            elif conf == "MEDIUM":
+                conf_item.setForeground(QColor("#fbbf24"))
+            else:
+                conf_item.setForeground(QColor("#a6adc8"))
+            self.vb_table.setItem(row, 10, conf_item)
+
             # Row color based on market
             if b["selection"] == "Home Win":
                 bg = QColor("#1a3a2a")
@@ -722,12 +785,25 @@ class ValueTab(QWidget):
         self.vb_table.setSortingEnabled(True)
 
         if bets:
-            avg_edge = sum(b["edge"] for b in bets) / len(bets)
+            summary = value_summary(bets)
+            conf_str = ", ".join(
+                f"{k}: {v}" for k, v in sorted(summary["by_confidence"].items())
+            )
+            best = summary["best_bet"]
+            best_str = ""
+            if best:
+                best_str = (
+                    f"  |  Best: {best['home_team']} vs {best['away_team']} "
+                    f"{best['selection']} @ {best['best_odds']:.2f} "
+                    f"(edge {best['edge']}%, EV £{best['expected_value']:.2f})"
+                )
             self.vb_summary.setText(
                 f"Found {len(bets)} value bets  |  "
-                f"Avg edge: {avg_edge:.1f}%  |  "
+                f"Avg edge: {summary['avg_edge']:.1f}%  |  "
                 f"Total stake: £{total_stake:.2f}  |  "
-                f"Total EV: £{total_ev:.2f}"
+                f"Total EV: £{total_ev:.2f}  |  "
+                f"Confidence: {conf_str}"
+                f"{best_str}"
             )
         else:
             self.vb_summary.setText(
@@ -774,6 +850,25 @@ class ValueTab(QWidget):
             score_item = QTableWidgetItem(score_text)
             score_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.prob_table.setItem(row, 8, score_item)
+
+            # Overround (bookmaker margin)
+            h_odds = p.get("b365_home") or p.get("max_home")
+            d_odds = p.get("b365_draw") or p.get("max_draw")
+            a_odds = p.get("b365_away") or p.get("max_away")
+            if h_odds and d_odds and a_odds:
+                ov = calculate_overround(h_odds, d_odds, a_odds)
+                ov_item = QTableWidgetItem(f"{ov:.1f}%")
+                ov_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if ov <= 3.0:
+                    ov_item.setForeground(QColor("#22c55e"))  # Low = good for punter
+                elif ov <= 7.0:
+                    ov_item.setForeground(QColor("#fbbf24"))
+                else:
+                    ov_item.setForeground(QColor("#ef4444"))  # High = bad
+            else:
+                ov_item = QTableWidgetItem("-")
+                ov_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.prob_table.setItem(row, 9, ov_item)
 
             # Highlight the favourite
             ph = p["p_home"]

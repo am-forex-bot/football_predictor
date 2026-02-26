@@ -136,18 +136,35 @@ def download_fixtures_openfootball(league_code: str) -> pd.DataFrame:
     season = get_current_season_code()
     start_year = 2000 + int(season[:2])
     end_year = start_year + 1
-    season_path = f"{start_year % 100:02d}{end_year % 100:02d}"
     # openfootball uses "2025-26" format
     season_dir = f"{start_year}-{end_year % 100:02d}"
-    url = f"{OPENFOOTBALL_BASE}/{season_dir}/{of_json}"
 
-    try:
-        text = _fetch_csv(url)  # works for any text, not just CSV
-        data = json.loads(text)
-    except Exception:
+    # Try multiple URL patterns — openfootball repo structure can vary
+    urls_to_try = [
+        f"{OPENFOOTBALL_BASE}/{season_dir}/{of_json}",
+        # Some repos use full-year format
+        f"{OPENFOOTBALL_BASE}/{start_year}-{end_year}/{of_json}",
+    ]
+
+    data = None
+    for url in urls_to_try:
+        try:
+            text = _fetch_csv(url, retries=2)
+            data = json.loads(text)
+            if data.get("matches"):
+                break
+        except Exception:
+            continue
+
+    if not data:
         return pd.DataFrame()
 
+    # openfootball may nest matches inside "rounds"
     matches = data.get("matches", [])
+    if not matches and "rounds" in data:
+        for rnd in data["rounds"]:
+            matches.extend(rnd.get("matches", []))
+
     if not matches:
         return pd.DataFrame()
 

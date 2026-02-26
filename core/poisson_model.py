@@ -247,14 +247,46 @@ class PoissonModel:
 
     def predict_fixtures(self, results_df: pd.DataFrame,
                          fixtures_df: pd.DataFrame) -> list[dict]:
-        """Predict all upcoming fixtures."""
+        """Predict all upcoming fixtures.
+
+        Handles both column conventions:
+        - Team/Opponent (cleaned format)
+        - HomeTeam/AwayTeam (raw format)
+
+        If team names from odds API don't match the model's trained names,
+        attempts fuzzy matching via the odds_provider._match_team function.
+        """
         self.fit(results_df)
         predictions = []
 
+        # Determine column names
+        if "Team" in fixtures_df.columns:
+            home_col, away_col = "Team", "Opponent"
+        elif "HomeTeam" in fixtures_df.columns:
+            home_col, away_col = "HomeTeam", "AwayTeam"
+        else:
+            return predictions
+
+        # All team names the model knows about
+        known_teams = list(self._team_stats.keys())
+
         for _, fix in fixtures_df.iterrows():
-            home = fix["Team"]
-            away = fix["Opponent"]
+            home = fix[home_col]
+            away = fix[away_col]
+
             pred = self.predict_match(home, away)
+
+            # If direct match fails, try fuzzy matching against known teams
+            if pred is None and known_teams:
+                try:
+                    from core.odds_provider import _match_team
+                    mapped_home = _match_team(home, known_teams) or home
+                    mapped_away = _match_team(away, known_teams) or away
+                    if mapped_home != home or mapped_away != away:
+                        pred = self.predict_match(mapped_home, mapped_away)
+                except ImportError:
+                    pass
+
             if pred is None:
                 continue
 
