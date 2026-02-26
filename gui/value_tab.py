@@ -7,7 +7,7 @@ Integrates Poisson model probabilities with bookmaker odds to find +EV opportuni
 import pandas as pd
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QComboBox,
-    QPushButton, QLabel, QSpinBox, QDoubleSpinBox, QTableWidget,
+    QPushButton, QLabel, QSpinBox, QDoubleSpinBox, QLineEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QTabWidget, QFrame,
     QSplitter, QScrollArea,
 )
@@ -19,6 +19,10 @@ from core.poisson_model import PoissonModel, PoissonConfig
 from core.value_engine import (
     ValueEngine, BankrollConfig, odds_to_prob, calculate_edge,
     kelly_stake, expected_value,
+)
+from core.odds_provider import (
+    fetch_odds, merge_odds_into_fixtures, get_sport_key,
+    load_api_key, save_api_key,
 )
 
 
@@ -164,6 +168,29 @@ class ValueTab(QWidget):
         config_layout.addWidget(self.backtest_btn)
 
         layout.addWidget(config_group)
+
+        # ── Odds API key row ─────────────────────────────────────────
+        odds_group = QGroupBox("Live Odds (the-odds-api.com — free, 500 req/month)")
+        odds_layout = QHBoxLayout(odds_group)
+        odds_layout.setSpacing(6)
+
+        odds_layout.addWidget(QLabel("API Key:"))
+        self.api_key_edit = QLineEdit()
+        self.api_key_edit.setPlaceholderText(
+            "Paste your free API key from https://the-odds-api.com"
+        )
+        self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key_edit.setMinimumWidth(280)
+        self.api_key_edit.setText(load_api_key())
+        self.api_key_edit.editingFinished.connect(self._save_api_key)
+        odds_layout.addWidget(self.api_key_edit)
+
+        self.odds_status = QLabel("")
+        self.odds_status.setStyleSheet("color: #a6adc8; font-size: 11px;")
+        odds_layout.addWidget(self.odds_status)
+
+        odds_layout.addStretch()
+        layout.addWidget(odds_group)
 
         # ── Sub-tabs ──────────────────────────────────────────────────
         self.sub_tabs = QTabWidget()
@@ -404,6 +431,10 @@ class ValueTab(QWidget):
 
     # ── Actions ────────────────────────────────────────────────────────
 
+    def _save_api_key(self):
+        """Save the API key when the user finishes editing."""
+        save_api_key(self.api_key_edit.text())
+
     def _get_config(self) -> tuple:
         """Build bankroll and Poisson configs from UI."""
         bankroll_cfg = BankrollConfig(
@@ -414,6 +445,62 @@ class ValueTab(QWidget):
         )
         poisson_cfg = PoissonConfig()
         return bankroll_cfg, poisson_cfg
+
+    def _fetch_live_odds(self, league_code: str,
+                         fixtures_df: pd.DataFrame) -> pd.DataFrame:
+        """Fetch live odds and merge into fixtures. Returns updated df."""
+        api_key = self.api_key_edit.text().strip()
+        if not api_key:
+            self.odds_status.setText("No API key — skipping live odds")
+            self.odds_status.setStyleSheet("color: #fbbf24; font-size: 11px;")
+            return fixtures_df
+
+        sport = get_sport_key(league_code)
+        if not sport:
+            self.odds_status.setText(f"League {league_code} not supported by odds API")
+            self.odds_status.setStyleSheet("color: #fbbf24; font-size: 11px;")
+            return fixtures_df
+
+        try:
+            self.main_window.set_status("Fetching live odds...")
+            result = fetch_odds(league_code, api_key)
+            odds_data = result["odds"]
+            remaining = result["remaining_requests"]
+
+            if not odds_data:
+                self.odds_status.setText("No upcoming odds found for this league")
+                self.odds_status.setStyleSheet("color: #fbbf24; font-size: 11px;")
+                return fixtures_df
+
+            # Merge odds into fixtures
+            updated = merge_odds_into_fixtures(fixtures_df, odds_data)
+
+            # Count how many fixtures got odds
+            if "Home_Odds" in updated.columns:
+                n_with_odds = updated["Home_Odds"].notna().sum()
+            elif "Max_Home_Odds" in updated.columns:
+                n_with_odds = updated["Max_Home_Odds"].notna().sum()
+            else:
+                n_with_odds = 0
+
+            self.odds_status.setText(
+                f"{len(odds_data)} fixtures with odds, "
+                f"{n_with_odds} matched  |  "
+                f"API calls left: {remaining}"
+            )
+            self.odds_status.setStyleSheet("color: #22c55e; font-size: 11px;")
+
+            save_api_key(api_key)
+            return updated
+
+        except ValueError as e:
+            self.odds_status.setText(str(e))
+            self.odds_status.setStyleSheet("color: #ef4444; font-size: 11px;")
+            return fixtures_df
+        except Exception as e:
+            self.odds_status.setText(f"Odds fetch failed: {e}")
+            self.odds_status.setStyleSheet("color: #ef4444; font-size: 11px;")
+            return fixtures_df
 
     def _on_run(self):
         code = self.league_combo.currentData()
@@ -427,6 +514,10 @@ class ValueTab(QWidget):
             return
 
         results_df, fixtures_df, table_df = data
+
+        # Fetch live odds and merge into fixtures
+        fixtures_df = self._fetch_live_odds(code, fixtures_df)
+
         bankroll_cfg, poisson_cfg = self._get_config()
 
         self.run_btn.setEnabled(False)
