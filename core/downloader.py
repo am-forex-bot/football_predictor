@@ -86,6 +86,39 @@ def download_fixtures() -> pd.DataFrame:
     return _parse_csv_text(text)
 
 
+def _merge_fixtures_with_odds(of_df: pd.DataFrame, fd_df: pd.DataFrame) -> pd.DataFrame:
+    """Merge openfootball fixture list with football-data.co.uk odds.
+
+    Openfootball provides comprehensive fixture lists but no bookmaker odds.
+    Football-data.co.uk fixtures.csv provides pre-match odds (B365, Max, etc.).
+    This merges odds into the openfootball fixtures where matches line up,
+    and includes any football-data fixtures not in openfootball.
+    """
+    # Identify odds columns (everything except basic fixture metadata)
+    meta = {"Div", "Date", "HomeTeam", "AwayTeam", "FTR", "Time"}
+    odds_cols = [c for c in fd_df.columns if c not in meta]
+
+    if not odds_cols:
+        return of_df
+
+    # Left join: keep all openfootball fixtures, add odds where matched
+    fd_odds = fd_df[["HomeTeam", "AwayTeam"] + odds_cols].drop_duplicates(
+        subset=["HomeTeam", "AwayTeam"]
+    )
+    merged = of_df.merge(fd_odds, on=["HomeTeam", "AwayTeam"], how="left")
+
+    # Also include any football-data fixtures NOT in openfootball
+    of_keys = set(zip(of_df["HomeTeam"], of_df["AwayTeam"]))
+    fd_only = fd_df[
+        ~fd_df.apply(lambda r: (r["HomeTeam"], r["AwayTeam"]) in of_keys, axis=1)
+    ]
+
+    if not fd_only.empty:
+        merged = pd.concat([merged, fd_only], ignore_index=True)
+
+    return merged
+
+
 def download_fixtures_openfootball(league_code: str) -> pd.DataFrame:
     """Download fixtures from openfootball/football.json on GitHub.
 
@@ -197,13 +230,12 @@ class DownloadWorker(QObject):
                 f"  Current season: {played} played, {upcoming} upcoming."
             )
 
-            # Download fixtures from openfootball (primary source - GitHub hosted, reliable)
+            # Download fixtures from openfootball (comprehensive fixture list)
             self.progress.emit("Downloading fixtures from openfootball...")
-            league_fixtures = pd.DataFrame()
+            of_fixtures = pd.DataFrame()
             try:
                 of_fixtures = download_fixtures_openfootball(self.league_code)
                 if not of_fixtures.empty:
-                    league_fixtures = of_fixtures
                     self.progress.emit(
                         f"  Fixtures: {len(of_fixtures)} upcoming from openfootball"
                     )
@@ -212,28 +244,46 @@ class DownloadWorker(QObject):
             except Exception as e:
                 self.progress.emit(f"  Warning: openfootball failed: {e}")
 
-            # Fallback: try football-data.co.uk fixtures.csv
-            if league_fixtures.empty:
-                self.progress.emit("Trying football-data.co.uk fixtures.csv fallback...")
-                try:
-                    fixtures_df = download_fixtures()
-                    if "Div" in fixtures_df.columns:
-                        fd_fixtures = fixtures_df[
-                            fixtures_df["Div"] == self.league_code
-                        ].copy()
-                        if not fd_fixtures.empty:
-                            league_fixtures = fd_fixtures
-                            self.progress.emit(
-                                f"  Fallback: {len(fd_fixtures)} fixtures from football-data.co.uk"
-                            )
-                        else:
-                            self.progress.emit("  Fallback: no fixtures for this league.")
+            # Always try football-data.co.uk for bookmaker odds
+            self.progress.emit("Downloading odds from football-data.co.uk...")
+            fd_fixtures = pd.DataFrame()
+            try:
+                all_fixtures = download_fixtures()
+                if "Div" in all_fixtures.columns:
+                    fd_fixtures = all_fixtures[
+                        all_fixtures["Div"] == self.league_code
+                    ].copy()
+                    if not fd_fixtures.empty:
+                        self.progress.emit(
+                            f"  Odds: {len(fd_fixtures)} fixtures with bookmaker odds"
+                        )
                     else:
-                        self.progress.emit("  Fallback: no Div column to filter by.")
-                except Exception as e:
-                    self.progress.emit(f"  Fallback also failed: {e}")
+                        self.progress.emit("  No odds data for this league.")
+                else:
+                    self.progress.emit("  Odds source: no Div column found.")
+            except Exception as e:
+                self.progress.emit(f"  Odds download failed: {e}")
 
-            if league_fixtures.empty:
+            # Merge: openfootball fixtures + football-data odds
+            if not of_fixtures.empty and not fd_fixtures.empty:
+                league_fixtures = _merge_fixtures_with_odds(of_fixtures, fd_fixtures)
+                n_with_odds = league_fixtures.iloc[:, 5:].notna().any(axis=1).sum()
+                self.progress.emit(
+                    f"  Merged: {len(league_fixtures)} fixtures, "
+                    f"{n_with_odds} with bookmaker odds"
+                )
+            elif not fd_fixtures.empty:
+                league_fixtures = fd_fixtures
+                self.progress.emit(
+                    f"  Using {len(fd_fixtures)} football-data fixtures (with odds)"
+                )
+            elif not of_fixtures.empty:
+                league_fixtures = of_fixtures
+                self.progress.emit(
+                    f"  Using {len(of_fixtures)} openfootball fixtures (no odds)"
+                )
+            else:
+                league_fixtures = pd.DataFrame()
                 self.progress.emit("  No fixtures found from any source.")
 
             self.finished.emit({

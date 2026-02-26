@@ -71,6 +71,25 @@ class ValueTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setSpacing(6)
 
+        # ── Quick guide ───────────────────────────────────────────────
+        guide_label = QLabel(
+            "<b>Quick guide:</b> "
+            "<b>Min Edge</b> = how much better than the bookies' price the model "
+            "needs to be before flagging a bet (start at 5%).  "
+            "<b>Kelly %</b> = how aggressively to stake — 25% (quarter Kelly) is "
+            "standard, keeps bets around 1-3% of bankroll.  "
+            "<b>Bankroll</b> = your total betting pot.  "
+            "Always <b>Backtest</b> a league first — if ROI is negative, "
+            "the model has no edge there."
+        )
+        guide_label.setWordWrap(True)
+        guide_label.setStyleSheet(
+            "padding: 6px 10px; border-radius: 4px; "
+            "background-color: rgba(59, 130, 246, 0.12); "
+            "color: #93c5fd; font-size: 11px;"
+        )
+        layout.addWidget(guide_label)
+
         # ── Configuration ─────────────────────────────────────────────
         config_group = QGroupBox("Value Betting Configuration")
         config_layout = QHBoxLayout(config_group)
@@ -85,11 +104,15 @@ class ValueTab(QWidget):
         self.min_edge_spin = QDoubleSpinBox()
         self.min_edge_spin.setRange(1.0, 20.0)
         self.min_edge_spin.setSingleStep(0.5)
-        self.min_edge_spin.setValue(3.0)
+        self.min_edge_spin.setValue(5.0)
         self.min_edge_spin.setDecimals(1)
         self.min_edge_spin.setToolTip(
-            "Minimum edge required to flag a value bet.\n"
-            "3% is aggressive, 5% is conservative."
+            "Minimum edge to flag a value bet.\n"
+            "Edge = model probability minus bookmaker implied probability.\n\n"
+            "  3% = aggressive (more bets, thinner margins)\n"
+            "  5% = recommended starting point\n"
+            "  8-10% = conservative (fewer but stronger bets)\n\n"
+            "If you're losing, raise this. If you get zero bets, lower it."
         )
         config_layout.addWidget(self.min_edge_spin)
 
@@ -100,8 +123,13 @@ class ValueTab(QWidget):
         self.kelly_spin.setValue(25.0)
         self.kelly_spin.setDecimals(0)
         self.kelly_spin.setToolTip(
-            "Fraction of full Kelly criterion to use.\n"
-            "25% (quarter Kelly) is standard. Higher = more variance."
+            "Fraction of full Kelly criterion for stake sizing.\n"
+            "Kelly calculates the mathematically optimal bet size\n"
+            "based on your edge — but full Kelly is too aggressive.\n\n"
+            "  10-15% = very cautious (tiny bets, slow growth)\n"
+            "  25% = recommended (quarter Kelly, industry standard)\n"
+            "  50% = aggressive (bigger swings, higher risk)\n\n"
+            "Leave at 25% unless you have a specific reason to change."
         )
         config_layout.addWidget(self.kelly_spin)
 
@@ -112,6 +140,13 @@ class ValueTab(QWidget):
         self.bankroll_spin.setValue(1000.0)
         self.bankroll_spin.setDecimals(0)
         self.bankroll_spin.setPrefix("£")
+        self.bankroll_spin.setToolTip(
+            "Your total betting pot.\n"
+            "Kelly stakes are calculated as a percentage of this.\n\n"
+            "  £100 bankroll  =>  bets around £1-3 each\n"
+            "  £1,000 bankroll  =>  bets around £10-30 each\n\n"
+            "Set this to what you're actually willing to bet with."
+        )
         config_layout.addWidget(self.bankroll_spin)
 
         config_layout.addStretch()
@@ -547,10 +582,12 @@ class ValueTab(QWidget):
             )
         else:
             self.vb_summary.setText(
-                "No value bets found. This can mean:\n"
-                "- No fixtures with odds available\n"
-                "- No edge over bookmaker prices (try lowering min edge %)\n"
-                "- Not enough match data for Poisson model"
+                "No value bets found. Common reasons:\n"
+                "- No fixtures downloaded — re-download the league on the Download tab\n"
+                "- Fixtures have no bookmaker odds — football-data.co.uk may not "
+                "have pre-match odds for this league yet\n"
+                "- No edge over bookmaker prices — try lowering Min Edge %\n"
+                "- Try the Backtest button to check if the model has edge on this league"
             )
 
         # Also populate the probabilities tab from the same run
