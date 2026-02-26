@@ -24,7 +24,8 @@ from core.value_engine import (
 
 class _ValueWorker(QThread):
     """Run value bet analysis in background thread."""
-    finished = pyqtSignal(list, dict, list)  # value_bets, backtest_results, ratings
+    # value_bets, backtest_results, ratings, all_predictions
+    finished = pyqtSignal(list, dict, list, list)
     error = pyqtSignal(str)
 
     def __init__(self, results_df, fixtures_df, bankroll_cfg, poisson_cfg, run_backtest=False):
@@ -39,11 +40,13 @@ class _ValueWorker(QThread):
         try:
             engine = ValueEngine(self.bankroll_cfg, self.poisson_cfg)
 
-            # Find value bets
+            # Find value bets (also stores all predictions in engine)
             if self.fixtures_df is not None and not self.fixtures_df.empty:
                 value_bets = engine.find_value_bets(self.results_df, self.fixtures_df)
+                predictions = getattr(engine, "last_predictions", [])
             else:
                 value_bets = []
+                predictions = []
                 # Still fit the model for ratings
                 engine.poisson.fit(self.results_df)
 
@@ -55,7 +58,7 @@ class _ValueWorker(QThread):
             # Team ratings
             ratings = engine.poisson.get_team_ratings()
 
-            self.finished.emit(value_bets, bt, ratings)
+            self.finished.emit(value_bets, bt, ratings, predictions)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -467,12 +470,16 @@ class ValueTab(QWidget):
         self.backtest_btn.setEnabled(True)
         self.main_window.set_status(f"Error: {msg}")
 
-    def _on_results(self, value_bets: list, backtest: dict, ratings: list):
+    def _on_results(self, value_bets: list, backtest: dict,
+                    ratings: list, predictions: list):
         self.run_btn.setEnabled(True)
         self.backtest_btn.setEnabled(True)
 
         # Display value bets
         self._display_value_bets(value_bets)
+
+        # Display all model predictions (works even without odds)
+        self._display_predictions(predictions)
 
         # Display team ratings
         self._display_ratings(ratings)
@@ -483,17 +490,30 @@ class ValueTab(QWidget):
             self.sub_tabs.setCurrentIndex(4)  # Switch to backtest tab
         elif value_bets:
             self.sub_tabs.setCurrentIndex(0)  # Switch to value bets tab
-        else:
+        elif predictions:
             self.sub_tabs.setCurrentIndex(1)  # Show probabilities
+        else:
+            self.sub_tabs.setCurrentIndex(2)  # Show ratings
 
         # Update bankroll display
         self._refresh_bankroll()
 
+        n_preds = len(predictions)
         n_bets = len(value_bets)
-        total_ev = sum(b["expected_value"] for b in value_bets)
-        self.main_window.set_status(
-            f"Found {n_bets} value bets  |  Total EV: £{total_ev:.2f}"
+        n_with_odds = sum(
+            1 for p in predictions
+            if p.get("b365_home") is not None or p.get("max_home") is not None
         )
+        total_ev = sum(b["expected_value"] for b in value_bets)
+
+        parts = [f"{n_preds} fixtures predicted"]
+        if n_with_odds > 0:
+            parts.append(f"{n_with_odds} with odds")
+        else:
+            parts.append("no bookmaker odds available")
+        if n_bets > 0:
+            parts.append(f"{n_bets} value bets (EV: £{total_ev:.2f})")
+        self.main_window.set_status("  |  ".join(parts))
 
     def _display_value_bets(self, bets: list):
         """Populate the value bets table."""
@@ -582,51 +602,85 @@ class ValueTab(QWidget):
             )
         else:
             self.vb_summary.setText(
-                "No value bets found. Common reasons:\n"
-                "- No fixtures downloaded — re-download the league on the Download tab\n"
-                "- Fixtures have no bookmaker odds — football-data.co.uk may not "
-                "have pre-match odds for this league yet\n"
-                "- No edge over bookmaker prices — try lowering Min Edge %\n"
-                "- Try the Backtest button to check if the model has edge on this league"
+                "No value bets found — this needs bookmaker odds to calculate edge.\n"
+                "Check the Match Probabilities tab for model predictions on all fixtures.\n"
+                "If odds are missing, re-download the league to fetch the latest prices.\n"
+                "Use the Backtest button to test if the model has edge on this league."
             )
 
-        # Also populate the probabilities tab from the same run
-        self._display_probabilities_from_bets(bets)
+    def _display_predictions(self, predictions: list):
+        """Populate Match Probabilities tab from all Poisson predictions.
 
-    def _display_probabilities_from_bets(self, bets: list):
-        """Populate match probabilities from value bet analysis."""
-        # Deduplicate by match
-        seen = set()
-        matches = []
-        for b in bets:
-            key = f"{b['home_team']}_{b['away_team']}"
-            if key not in seen:
-                seen.add(key)
-                matches.append(b)
-
-        # If we have predictions from the model, also show non-value matches
-        # For now, show what we have from value analysis
+        Shows model output for every fixture regardless of whether
+        bookmaker odds are available.
+        """
         self.prob_table.setSortingEnabled(False)
-        self.prob_table.setRowCount(len(matches))
+        self.prob_table.setRowCount(len(predictions))
 
-        for row, m in enumerate(matches):
-            match_text = f"{m['home_team']} vs {m['away_team']}"
+        for row, p in enumerate(predictions):
+            match_text = f"{p['home_team']} vs {p['away_team']}"
             self.prob_table.setItem(row, 0, QTableWidgetItem(match_text))
 
-            items = [
-                (1, f"{m['home_xg']:.2f}"),
-                (2, f"{m['away_xg']:.2f}"),
+            cells = [
+                (1, f"{p['home_xg']:.2f}"),
+                (2, f"{p['away_xg']:.2f}"),
+                (3, f"{p['p_home'] * 100:.1f}%"),
+                (4, f"{p['p_draw'] * 100:.1f}%"),
+                (5, f"{p['p_away'] * 100:.1f}%"),
+                (6, f"{p['p_over_25'] * 100:.1f}%"),
+                (7, f"{p['p_btts_yes'] * 100:.1f}%"),
             ]
-            for col, text in items:
+            for col, text in cells:
                 item = QTableWidgetItem(text)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.prob_table.setItem(row, col, item)
 
+            # Most likely scoreline
+            cs = p.get("correct_scores", {})
+            if cs:
+                top_score = max(cs, key=cs.get)
+                score_text = f"{top_score} ({cs[top_score]:.0f}%)"
+            else:
+                score_text = "-"
+            score_item = QTableWidgetItem(score_text)
+            score_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.prob_table.setItem(row, 8, score_item)
+
+            # Highlight the favourite
+            ph = p["p_home"]
+            pd_ = p["p_draw"]
+            pa = p["p_away"]
+            fav = max(ph, pd_, pa)
+            if fav == ph:
+                bg = QColor("#1a3a2a")
+            elif fav == pa:
+                bg = QColor("#1a2a3a")
+            else:
+                bg = QColor("#3a3a1a")
+            for col in range(self.prob_table.columnCount()):
+                item = self.prob_table.item(row, col)
+                if item:
+                    item.setBackground(bg)
+
         self.prob_table.setSortingEnabled(True)
 
-        if matches:
+        n_with_odds = sum(
+            1 for p in predictions
+            if p.get("b365_home") is not None or p.get("max_home") is not None
+        )
+        if predictions:
+            parts = [f"Poisson model predictions for {len(predictions)} fixtures"]
+            if n_with_odds > 0:
+                parts.append(f"{n_with_odds} have bookmaker odds for value comparison")
+            else:
+                parts.append(
+                    "No bookmaker odds available — predictions shown but "
+                    "value bets require odds to calculate edge"
+                )
+            self.prob_summary.setText("  |  ".join(parts))
+        else:
             self.prob_summary.setText(
-                f"Poisson model probabilities for {len(matches)} matches"
+                "No fixtures to predict. Download a league with upcoming matches."
             )
 
     def _display_ratings(self, ratings: list):

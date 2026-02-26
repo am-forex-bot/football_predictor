@@ -198,10 +198,14 @@ class ValueEngine:
 
         Returns list of value bet opportunities sorted by edge (best first).
         Each entry includes all markets (1X2, O/U 2.5, BTTS).
+
+        Also stores all predictions (with or without odds) in self.last_predictions
+        so the GUI can display model probabilities for every fixture.
         """
         # Fit the Poisson model
         self.poisson.fit(results_df)
         predictions = self.poisson.predict_fixtures(results_df, fixtures_df)
+        self.last_predictions = predictions
 
         cfg = self.bankroll
         value_bets = []
