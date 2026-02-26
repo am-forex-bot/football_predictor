@@ -31,10 +31,10 @@ MAX_GOALS = 8
 @dataclass
 class PoissonConfig:
     """Configuration for the Poisson model."""
-    lookback: int = 30            # Matches per team to consider (0 = all)
+    lookback: int = 0             # Matches per team to consider (0 = all season data)
     decay_rate: float = 0.0       # Exponential decay (0 = equal weight, 0.03 = moderate)
     home_advantage: float = 0.0   # Additional home xG boost (0 = learned from data)
-    min_matches: int = 5          # Minimum matches required per team
+    min_matches: int = 3          # Minimum matches required per team
 
 
 def _poisson_pmf(k: int, lam: float) -> float:
@@ -147,23 +147,39 @@ class PoissonModel:
         return self
 
     def _apply_lookback(self, df: pd.DataFrame, lookback: int) -> pd.DataFrame:
-        """Keep only the most recent `lookback` home matches per team."""
-        # Each row is a home match. Take last N per home team.
-        # We also need away matches, so we track by both.
-        # Strategy: for each team as home, keep last lookback rows.
-        # For each team as away, keep last lookback rows.
-        # Then intersect (keep rows where BOTH home and away team have enough data).
+        """Keep only the most recent `lookback` matches per team.
 
-        # Actually, simpler: just take the most recent lookback matches overall
-        # for rating calculation. This ensures recency without complex filtering.
-        if len(df) <= lookback:
-            return df
-
-        # If Date column exists, sort by it; otherwise use row order
+        Each row is a home match (Team = home, Opponent = away).
+        For each team, we keep their most recent `lookback` appearances
+        as EITHER home or away. This ensures every team has enough data
+        for reliable ratings.
+        """
         if "Date" in df.columns:
             df = df.sort_values("Date", na_position="first")
 
-        return df.tail(lookback * 2).reset_index(drop=True)  # 2x because each row = 1 match with 2 teams
+        # Track which rows to keep — a row is kept if EITHER team
+        # still needs more matches in their lookback window
+        keep = set()
+        team_count: dict[str, int] = {}
+
+        # Walk backwards from most recent
+        for idx in reversed(df.index):
+            home = df.at[idx, "Team"]
+            away = df.at[idx, "Opponent"]
+
+            h_count = team_count.get(home, 0)
+            a_count = team_count.get(away, 0)
+
+            # Keep this row if either team hasn't filled their quota
+            if h_count < lookback or a_count < lookback:
+                keep.add(idx)
+                team_count[home] = h_count + 1
+                team_count[away] = a_count + 1
+
+        if not keep:
+            return df
+
+        return df.loc[sorted(keep)].reset_index(drop=True)
 
     def predict_match(self, home_team: str, away_team: str) -> Optional[dict]:
         """Predict a single match. Returns probability dict or None if teams unknown."""

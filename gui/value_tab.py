@@ -690,9 +690,14 @@ class ValueTab(QWidget):
         if n_with_odds > 0:
             parts.append(f"{n_with_odds} with odds")
         else:
-            parts.append("no bookmaker odds available")
+            if n_preds > 0:
+                parts.append("odds not attached — check team name matching")
+            else:
+                parts.append("no bookmaker odds available")
         if n_bets > 0:
             parts.append(f"{n_bets} value bets (EV: £{total_ev:.2f})")
+        elif n_preds > 0 and n_with_odds > 0:
+            parts.append("no value at current edge threshold — try lowering Min Edge %")
         self.main_window.set_status("  |  ".join(parts))
 
     def _display_value_bets(self, bets: list):
