@@ -268,13 +268,15 @@ class PoissonModel:
             else:
                 pred["date"] = None
 
-            # Add odds from fixture data
+            # Add odds from fixture data (1X2)
             for src, dst in [("Home_Odds", "b365_home"),
                              ("Draw_Odds", "b365_draw"),
                              ("Away_Odds", "b365_away"),
                              ("Max_Home_Odds", "max_home"),
                              ("Max_Draw_Odds", "max_draw"),
-                             ("Max_Away_Odds", "max_away")]:
+                             ("Max_Away_Odds", "max_away"),
+                             ("Over_25_Odds", "over_25_odds"),
+                             ("Under_25_Odds", "under_25_odds")]:
                 val = fix.get(src, float("nan"))
                 pred[dst] = float(val) if pd.notna(val) and val > 0 else None
 

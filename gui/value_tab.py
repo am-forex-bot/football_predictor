@@ -22,7 +22,8 @@ from core.value_engine import (
 )
 from core.odds_provider import (
     fetch_odds, merge_odds_into_fixtures, get_sport_key,
-    load_api_key, save_api_key,
+    load_api_key, save_api_key, save_config, load_bookmaker,
+    BOOKMAKERS,
 )
 
 
@@ -184,6 +185,22 @@ class ValueTab(QWidget):
         self.api_key_edit.setText(load_api_key())
         self.api_key_edit.editingFinished.connect(self._save_api_key)
         odds_layout.addWidget(self.api_key_edit)
+
+        odds_layout.addWidget(QLabel("  Bookmaker:"))
+        self.bookmaker_combo = QComboBox()
+        self.bookmaker_combo.setMinimumWidth(120)
+        saved_bm = load_bookmaker()
+        for name in BOOKMAKERS:
+            self.bookmaker_combo.addItem(name)
+        idx = self.bookmaker_combo.findText(saved_bm)
+        if idx >= 0:
+            self.bookmaker_combo.setCurrentIndex(idx)
+        else:
+            self.bookmaker_combo.setCurrentIndex(0)  # Bet365
+        self.bookmaker_combo.currentTextChanged.connect(
+            lambda t: save_config(bookmaker=t)
+        )
+        odds_layout.addWidget(self.bookmaker_combo)
 
         self.odds_status = QLabel("")
         self.odds_status.setStyleSheet("color: #a6adc8; font-size: 11px;")
@@ -462,8 +479,11 @@ class ValueTab(QWidget):
             return fixtures_df
 
         try:
-            self.main_window.set_status("Fetching live odds...")
-            result = fetch_odds(league_code, api_key)
+            bookmaker = self.bookmaker_combo.currentText()
+            self.main_window.set_status(
+                f"Fetching {bookmaker} odds..."
+            )
+            result = fetch_odds(league_code, api_key, bookmaker=bookmaker)
             odds_data = result["odds"]
             remaining = result["remaining_requests"]
 

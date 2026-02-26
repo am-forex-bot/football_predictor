@@ -270,10 +270,9 @@ class ValueEngine:
             })
 
         # ── Over/Under 2.5 Market ────────────────────────────────────
-        # football-data.co.uk may have O/U odds in fixtures — check pred dict
         ou_markets = [
-            ("Over 2.5", pred["p_over_25"], None),
-            ("Under 2.5", pred["p_under_25"], None),
+            ("Over 2.5", pred["p_over_25"], pred.get("over_25_odds")),
+            ("Under 2.5", pred["p_under_25"], pred.get("under_25_odds")),
         ]
 
         for market_name, model_prob, odds in ou_markets:

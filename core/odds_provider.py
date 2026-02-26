@@ -268,22 +268,59 @@ _CONFIG_FILE = os.path.join(
 )
 
 
-def load_api_key() -> str:
-    """Load saved API key."""
+def load_config() -> dict:
+    """Load saved config (API key + bookmaker preference)."""
     if os.path.exists(_CONFIG_FILE):
         try:
             with open(_CONFIG_FILE) as f:
-                return json.load(f).get("api_key", "")
+                return json.load(f)
         except Exception:
             pass
-    return ""
+    return {}
+
+
+def load_api_key() -> str:
+    """Load saved API key."""
+    return load_config().get("api_key", "")
+
+
+def load_bookmaker() -> str:
+    """Load saved bookmaker preference."""
+    return load_config().get("bookmaker", "bet365")
+
+
+def save_config(api_key: str = "", bookmaker: str = ""):
+    """Save config for next time."""
+    os.makedirs(os.path.dirname(_CONFIG_FILE), exist_ok=True)
+    existing = load_config()
+    if api_key:
+        existing["api_key"] = api_key.strip()
+    if bookmaker:
+        existing["bookmaker"] = bookmaker.strip()
+    with open(_CONFIG_FILE, "w") as f:
+        json.dump(existing, f)
 
 
 def save_api_key(key: str):
-    """Save API key for next time."""
-    os.makedirs(os.path.dirname(_CONFIG_FILE), exist_ok=True)
-    with open(_CONFIG_FILE, "w") as f:
-        json.dump({"api_key": key.strip()}, f)
+    """Save API key (convenience wrapper)."""
+    save_config(api_key=key)
+
+
+# Bookmaker keys used by the-odds-api
+BOOKMAKERS = {
+    "Bet365": "bet365",
+    "Pinnacle": "pinnacle",
+    "William Hill": "williamhill",
+    "Betfair Sportsbook": "betfair_sb_uk",
+    "Paddy Power": "paddypower",
+    "Ladbrokes": "ladbrokes_uk",
+    "Coral": "coral",
+    "Sky Bet": "skybet",
+    "Betway": "betway",
+    "Unibet": "unibet_uk",
+    "888sport": "sport888",
+    "All bookmakers": "",
+}
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -298,32 +335,15 @@ def get_sport_key(league_code: str) -> Optional[str]:
     return LEAGUE_TO_SPORT.get(league_code)
 
 
-def fetch_odds(league_code: str, api_key: str) -> dict:
+def fetch_odds(league_code: str, api_key: str,
+               bookmaker: str = "bet365") -> dict:
     """Fetch live bookmaker odds for upcoming fixtures.
 
-    Returns {
-        "odds": [
-            {
-                "home_team": "Arsenal",     # mapped to fd names
-                "away_team": "Man City",
-                "commence_time": "...",
-                "best_home": 2.60,
-                "best_draw": 3.40,
-                "best_away": 2.80,
-                "b365_home": 2.50,
-                "b365_draw": 3.30,
-                "b365_away": 2.75,
-                "pin_home": ...,    # Pinnacle (sharp line)
-                "pin_draw": ...,
-                "pin_away": ...,
-                "avg_home": 2.55,
-                "avg_draw": 3.35,
-                "avg_away": 2.78,
-            }, ...
-        ],
-        "remaining_requests": 480,
-        "used_requests": 20,
-    }
+    Fetches 1X2 (h2h) and Over/Under 2.5 (totals) markets.
+    Filters to the specified bookmaker so you only see prices you can get.
+
+    API cost: 1 request per call (h2h + totals in one request).
+    Free tier: 500 requests/month.
 
     Raises ValueError if league not supported or API key invalid.
     """
@@ -345,9 +365,14 @@ def fetch_odds(league_code: str, api_key: str) -> dict:
     params = {
         "apiKey": api_key.strip(),
         "regions": "uk,eu",
-        "markets": "h2h",
+        "markets": "h2h,totals",
         "oddsFormat": "decimal",
     }
+
+    # Filter to specific bookmaker if set (reduces noise, not cost)
+    bm_key = BOOKMAKERS.get(bookmaker, bookmaker)
+    if bm_key:
+        params["bookmakers"] = bm_key
 
     resp = requests.get(url, params=params, timeout=15)
 
@@ -361,20 +386,22 @@ def fetch_odds(league_code: str, api_key: str) -> dict:
 
     data = resp.json()
 
-    # Parse remaining quota from headers
     remaining = resp.headers.get("x-requests-remaining", "?")
     used = resp.headers.get("x-requests-used", "?")
 
     return {
-        "odds": _parse_odds(data),
+        "odds": _parse_odds(data, bm_key),
         "remaining_requests": remaining,
         "used_requests": used,
         "raw_count": len(data),
     }
 
 
-def _parse_odds(events: list) -> list[dict]:
-    """Parse the-odds-api response into our format."""
+def _parse_odds(events: list, target_bm: str = "") -> list[dict]:
+    """Parse the-odds-api response into our format.
+
+    Extracts 1X2 and Over/Under 2.5 odds from the target bookmaker.
+    """
     results = []
 
     for event in events:
@@ -386,58 +413,56 @@ def _parse_odds(events: list) -> list[dict]:
         if not bookmakers:
             continue
 
-        # Collect odds from all bookmakers
-        all_home, all_draw, all_away = [], [], []
-        b365 = {"home": None, "draw": None, "away": None}
-        pin = {"home": None, "draw": None, "away": None}
+        # 1X2 odds
+        h2h = {"home": None, "draw": None, "away": None}
+        # Over/Under 2.5
+        ou25 = {"over": None, "under": None}
 
         for bm in bookmakers:
             bm_key = bm.get("key", "")
-            markets = bm.get("markets", [])
 
-            for market in markets:
-                if market.get("key") != "h2h":
-                    continue
+            # If targeting a specific bookmaker, only use that one
+            if target_bm and bm_key != target_bm:
+                continue
 
-                outcomes = {o["name"]: o["price"] for o in market.get("outcomes", [])}
-                h = outcomes.get(home_raw)
-                d = outcomes.get("Draw")
-                a = outcomes.get(away_raw)
+            for market in bm.get("markets", []):
+                mkey = market.get("key", "")
 
-                if h and d and a:
-                    all_home.append(h)
-                    all_draw.append(d)
-                    all_away.append(a)
+                if mkey == "h2h":
+                    outcomes = {
+                        o["name"]: o["price"]
+                        for o in market.get("outcomes", [])
+                    }
+                    h = outcomes.get(home_raw)
+                    d = outcomes.get("Draw")
+                    a = outcomes.get(away_raw)
+                    if h and d and a:
+                        h2h = {"home": h, "draw": d, "away": a}
 
-                    if bm_key in ("betfair_ex_uk", "betfair"):
-                        pass  # Skip exchange odds for best price
-                    elif bm_key in ("bet365", "bet365_it"):
-                        b365 = {"home": h, "draw": d, "away": a}
-                    elif bm_key in ("pinnacle", "pinnacle_com"):
-                        pin = {"home": h, "draw": d, "away": a}
+                elif mkey == "totals":
+                    # Look for the 2.5 goals line
+                    for o in market.get("outcomes", []):
+                        point = o.get("point")
+                        if point == 2.5:
+                            if o["name"] == "Over":
+                                ou25["over"] = o["price"]
+                            elif o["name"] == "Under":
+                                ou25["under"] = o["price"]
 
-        if not all_home:
+        if h2h["home"] is None:
             continue
 
         results.append({
             "home_team_raw": home_raw,
             "away_team_raw": away_raw,
-            "home_team": home_raw,  # Will be remapped later
+            "home_team": home_raw,
             "away_team": away_raw,
             "commence_time": commence,
-            "best_home": max(all_home),
-            "best_draw": max(all_draw),
-            "best_away": max(all_away),
-            "b365_home": b365["home"],
-            "b365_draw": b365["draw"],
-            "b365_away": b365["away"],
-            "pin_home": pin["home"],
-            "pin_draw": pin["draw"],
-            "pin_away": pin["away"],
-            "avg_home": round(sum(all_home) / len(all_home), 2),
-            "avg_draw": round(sum(all_draw) / len(all_draw), 2),
-            "avg_away": round(sum(all_away) / len(all_away), 2),
-            "n_bookmakers": len(all_home),
+            "home_odds": h2h["home"],
+            "draw_odds": h2h["draw"],
+            "away_odds": h2h["away"],
+            "over_25_odds": ou25["over"],
+            "under_25_odds": ou25["under"],
         })
 
     return results
@@ -448,7 +473,10 @@ def merge_odds_into_fixtures(fixtures_df: pd.DataFrame,
     """Merge live odds into the fixtures DataFrame.
 
     Matches fixtures by team names and populates the odds columns
-    that the value engine expects (Home_Odds, Max_Home_Odds, etc.).
+    that the Poisson model and value engine expect:
+    - Home_Odds, Draw_Odds, Away_Odds (1X2)
+    - Max_Home_Odds etc. (set same as above for single-bookmaker mode)
+    - Over_25_Odds, Under_25_Odds (totals)
     """
     if fixtures_df.empty or not odds_data:
         return fixtures_df
@@ -478,13 +506,9 @@ def merge_odds_into_fixtures(fixtures_df: pd.DataFrame,
         odds_lookup[key] = o
 
     # Ensure odds columns exist
-    odds_columns = {
-        "Home_Odds": None, "Draw_Odds": None, "Away_Odds": None,
-        "Max_Home_Odds": None, "Max_Draw_Odds": None, "Max_Away_Odds": None,
-        "Avg_Home_Odds": None, "Avg_Draw_Odds": None, "Avg_Away_Odds": None,
-        "Pin_Home_Odds": None, "Pin_Draw_Odds": None, "Pin_Away_Odds": None,
-    }
-    for col in odds_columns:
+    for col in ("Home_Odds", "Draw_Odds", "Away_Odds",
+                "Max_Home_Odds", "Max_Draw_Odds", "Max_Away_Odds",
+                "Over_25_Odds", "Under_25_Odds"):
         if col not in df.columns:
             df[col] = float("nan")
 
@@ -500,25 +524,20 @@ def merge_odds_into_fixtures(fixtures_df: pd.DataFrame,
         o = odds_lookup[key]
         matched += 1
 
-        # Bet365 odds (or best if B365 not available)
-        df.at[idx, "Home_Odds"] = o.get("b365_home") or o["best_home"]
-        df.at[idx, "Draw_Odds"] = o.get("b365_draw") or o["best_draw"]
-        df.at[idx, "Away_Odds"] = o.get("b365_away") or o["best_away"]
+        # 1X2 odds
+        df.at[idx, "Home_Odds"] = o["home_odds"]
+        df.at[idx, "Draw_Odds"] = o["draw_odds"]
+        df.at[idx, "Away_Odds"] = o["away_odds"]
 
-        # Best available (max across bookmakers)
-        df.at[idx, "Max_Home_Odds"] = o["best_home"]
-        df.at[idx, "Max_Draw_Odds"] = o["best_draw"]
-        df.at[idx, "Max_Away_Odds"] = o["best_away"]
+        # Max = same as above in single-bookmaker mode
+        df.at[idx, "Max_Home_Odds"] = o["home_odds"]
+        df.at[idx, "Max_Draw_Odds"] = o["draw_odds"]
+        df.at[idx, "Max_Away_Odds"] = o["away_odds"]
 
-        # Market average
-        df.at[idx, "Avg_Home_Odds"] = o["avg_home"]
-        df.at[idx, "Avg_Draw_Odds"] = o["avg_draw"]
-        df.at[idx, "Avg_Away_Odds"] = o["avg_away"]
-
-        # Pinnacle (sharp line)
-        if o.get("pin_home"):
-            df.at[idx, "Pin_Home_Odds"] = o["pin_home"]
-            df.at[idx, "Pin_Draw_Odds"] = o["pin_draw"]
-            df.at[idx, "Pin_Away_Odds"] = o["pin_away"]
+        # Over/Under 2.5
+        if o.get("over_25_odds"):
+            df.at[idx, "Over_25_Odds"] = o["over_25_odds"]
+        if o.get("under_25_odds"):
+            df.at[idx, "Under_25_Odds"] = o["under_25_odds"]
 
     return df
