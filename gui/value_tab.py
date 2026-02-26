@@ -486,9 +486,22 @@ class ValueTab(QWidget):
             result = fetch_odds(league_code, api_key, bookmaker=bookmaker)
             odds_data = result["odds"]
             remaining = result["remaining_requests"]
+            raw_events = result.get("raw_events", 0)
+            source = result.get("source", bookmaker)
 
             if not odds_data:
-                self.odds_status.setText("No upcoming odds found for this league")
+                if raw_events == 0:
+                    msg = (
+                        "API returned 0 events — no upcoming matches "
+                        "for this league right now"
+                    )
+                else:
+                    msg = (
+                        f"API returned {raw_events} events but could not "
+                        f"extract odds — check API key / bookmaker selection  |  "
+                        f"API calls left: {remaining}"
+                    )
+                self.odds_status.setText(msg)
                 self.odds_status.setStyleSheet("color: #fbbf24; font-size: 11px;")
                 return fixtures_df
 
@@ -497,17 +510,22 @@ class ValueTab(QWidget):
 
             # Count how many fixtures got odds
             if "Home_Odds" in updated.columns:
-                n_with_odds = updated["Home_Odds"].notna().sum()
-            elif "Max_Home_Odds" in updated.columns:
-                n_with_odds = updated["Max_Home_Odds"].notna().sum()
+                n_with_odds = int(updated["Home_Odds"].notna().sum())
             else:
                 n_with_odds = 0
 
-            self.odds_status.setText(
-                f"{len(odds_data)} fixtures with odds, "
-                f"{n_with_odds} matched  |  "
-                f"API calls left: {remaining}"
-            )
+            # Build status message
+            parts = [f"{len(odds_data)} fixtures with odds"]
+            if n_with_odds > 0:
+                parts.append(f"{n_with_odds} matched to your fixtures")
+            else:
+                parts.append(
+                    "0 matched — team names may differ between sources"
+                )
+            parts.append(f"source: {source}")
+            parts.append(f"API calls left: {remaining}")
+
+            self.odds_status.setText("  |  ".join(parts))
             self.odds_status.setStyleSheet("color: #22c55e; font-size: 11px;")
 
             save_api_key(api_key)

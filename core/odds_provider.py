@@ -339,8 +339,10 @@ def fetch_odds(league_code: str, api_key: str,
                bookmaker: str = "bet365") -> dict:
     """Fetch live bookmaker odds for upcoming fixtures.
 
-    Fetches 1X2 (h2h) and Over/Under 2.5 (totals) markets.
-    Filters to the specified bookmaker so you only see prices you can get.
+    Fetches 1X2 (h2h) and Over/Under 2.5 (totals) markets from ALL
+    bookmakers in uk/eu regions.  Post-filters to the requested bookmaker
+    with automatic fallback to best-available if that bookmaker hasn't
+    published prices yet.
 
     API cost: 1 request per call (h2h + totals in one request).
     Free tier: 500 requests/month.
@@ -361,20 +363,18 @@ def fetch_odds(league_code: str, api_key: str,
             "and paste it into the API Key field."
         )
 
-    url = f"{_BASE}/sports/{sport}/odds/"
-    params = {
-        "apiKey": api_key.strip(),
-        "regions": "uk,eu",
-        "markets": "h2h,totals",
-        "oddsFormat": "decimal",
-    }
-
-    # Filter to specific bookmaker if set (reduces noise, not cost)
     bm_key = BOOKMAKERS.get(bookmaker, bookmaker)
-    if bm_key:
-        params["bookmakers"] = bm_key
 
-    resp = requests.get(url, params=params, timeout=15)
+    # Build URL with literal commas — Python requests percent-encodes
+    # commas (%2C) which the-odds-api doesn't decode properly.
+    key = api_key.strip()
+    url = (
+        f"{_BASE}/sports/{sport}/odds/"
+        f"?apiKey={key}&regions=uk,eu"
+        f"&markets=h2h,totals&oddsFormat=decimal"
+    )
+
+    resp = requests.get(url, timeout=15)
 
     if resp.status_code == 401:
         raise ValueError("Invalid API key. Check your key at https://the-odds-api.com")
@@ -389,18 +389,31 @@ def fetch_odds(league_code: str, api_key: str,
     remaining = resp.headers.get("x-requests-remaining", "?")
     used = resp.headers.get("x-requests-used", "?")
 
+    # Try target bookmaker first; fall back to best available
+    odds = _parse_odds(data, bm_key)
+    source = bookmaker
+
+    if not odds and bm_key:
+        # Target bookmaker has no odds — try all bookmakers
+        odds = _parse_odds(data, "")
+        if odds:
+            source = "best available (target bookmaker not found)"
+
     return {
-        "odds": _parse_odds(data, bm_key),
+        "odds": odds,
         "remaining_requests": remaining,
         "used_requests": used,
-        "raw_count": len(data),
+        "raw_events": len(data),
+        "source": source,
     }
 
 
 def _parse_odds(events: list, target_bm: str = "") -> list[dict]:
     """Parse the-odds-api response into our format.
 
-    Extracts 1X2 and Over/Under 2.5 odds from the target bookmaker.
+    If *target_bm* is set, only odds from that bookmaker are used.
+    If *target_bm* is empty, the best (highest) odds across all
+    bookmakers are used for each market.
     """
     results = []
 
@@ -413,10 +426,12 @@ def _parse_odds(events: list, target_bm: str = "") -> list[dict]:
         if not bookmakers:
             continue
 
-        # 1X2 odds
+        # 1X2 odds — track best across bookmakers
         h2h = {"home": None, "draw": None, "away": None}
         # Over/Under 2.5
         ou25 = {"over": None, "under": None}
+        # Which bookmaker provided the h2h odds
+        h2h_source = ""
 
         for bm in bookmakers:
             bm_key = bm.get("key", "")
@@ -437,17 +452,21 @@ def _parse_odds(events: list, target_bm: str = "") -> list[dict]:
                     d = outcomes.get("Draw")
                     a = outcomes.get(away_raw)
                     if h and d and a:
-                        h2h = {"home": h, "draw": d, "away": a}
+                        # When no target: pick best home odds
+                        if h2h["home"] is None or h > h2h["home"]:
+                            h2h = {"home": h, "draw": d, "away": a}
+                            h2h_source = bm.get("title", bm_key)
 
                 elif mkey == "totals":
-                    # Look for the 2.5 goals line
                     for o in market.get("outcomes", []):
                         point = o.get("point")
                         if point == 2.5:
                             if o["name"] == "Over":
-                                ou25["over"] = o["price"]
+                                if ou25["over"] is None or o["price"] > ou25["over"]:
+                                    ou25["over"] = o["price"]
                             elif o["name"] == "Under":
-                                ou25["under"] = o["price"]
+                                if ou25["under"] is None or o["price"] > ou25["under"]:
+                                    ou25["under"] = o["price"]
 
         if h2h["home"] is None:
             continue
@@ -463,6 +482,7 @@ def _parse_odds(events: list, target_bm: str = "") -> list[dict]:
             "away_odds": h2h["away"],
             "over_25_odds": ou25["over"],
             "under_25_odds": ou25["under"],
+            "bookmaker": h2h_source,
         })
 
     return results
