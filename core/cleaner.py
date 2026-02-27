@@ -381,8 +381,11 @@ def process_and_save(raw_df: pd.DataFrame, fixtures_raw_df: pd.DataFrame | None,
     # Fixtures from the dedicated fixtures.csv (if provided)
     if fixtures_raw_df is not None and not fixtures_raw_df.empty:
         fixtures_extra = extract_fixtures(fixtures_raw_df)
-        # Merge and deduplicate
-        fixtures = pd.concat([fixtures_from_csv, fixtures_extra], ignore_index=True)
+        # Merge and deduplicate — put fixtures_extra FIRST because it has
+        # Bet365 odds from football-data.co.uk fixtures.csv.
+        # drop_duplicates keeps the first occurrence, so the version WITH
+        # odds wins over the season CSV version (which has no odds).
+        fixtures = pd.concat([fixtures_extra, fixtures_from_csv], ignore_index=True)
         fixtures = fixtures.drop_duplicates(subset=["Team", "Opponent"]).reset_index(drop=True)
     else:
         fixtures = fixtures_from_csv
