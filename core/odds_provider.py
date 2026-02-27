@@ -506,10 +506,29 @@ def fetch_odds(league_code: str, api_key: str,
             odds = _parse_odds(data, matched_key)
             source = f"{bookmaker} (matched as '{matched_key}')"
         else:
+            # Try Soccerway as fallback for Bet365 odds
+            if "bet365" in bm_key.lower() or "bet365" in bookmaker.lower():
+                try:
+                    from core.soccerway import fetch_soccerway_odds
+                    log.info("Trying Soccerway as Bet365 odds source...")
+                    sw_result = fetch_soccerway_odds(league_code)
+                    if sw_result["odds"]:
+                        log.info("Soccerway returned %d fixtures with Bet365 odds",
+                                 len(sw_result["odds"]))
+                        return {
+                            "odds": sw_result["odds"],
+                            "remaining_requests": remaining,
+                            "used_requests": used,
+                            "raw_events": len(sw_result["odds"]),
+                            "source": "Bet365 (via Soccerway)",
+                        }
+                except Exception as e:
+                    log.warning("Soccerway fallback failed: %s", e)
+
             # No match at all — return no odds rather than fake prices
             source = (
-                f"{bookmaker} not available on API. "
-                f"Available: {', '.join(sorted(all_bm_keys)[:8])}"
+                f"{bookmaker} not on the-odds-api. "
+                f"Bet365 odds from football-data.co.uk will be used instead"
             )
 
     log.info("Parsed %d fixtures with odds (source: %s)", len(odds), source)

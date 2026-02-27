@@ -188,14 +188,22 @@ def extract_fixtures(raw_df: pd.DataFrame) -> pd.DataFrame:
     # Flag whether these are confirmed future or possibly already played
     result["_future_only"] = is_future_only
 
-    # Bet365 odds
+    # Bet365 odds — 1X2
     for src, dst in [("B365H", "Home_Odds"), ("B365D", "Draw_Odds"), ("B365A", "Away_Odds")]:
         if src in df.columns:
             result[dst] = pd.to_numeric(df[src].values, errors="coerce")
 
-    # Best available odds
-    for suffix, dst in [("H", "Max_Home_Odds"), ("D", "Max_Draw_Odds"), ("A", "Max_Away_Odds")]:
-        result[dst] = _best_odds(df, suffix).values
+    # Bet365 Over/Under 2.5 odds (football-data.co.uk fixtures.csv uses B365>2.5 / B365<2.5)
+    for src, dst in [("B365>2.5", "Over_25_Odds"), ("B365<2.5", "Under_25_Odds")]:
+        if src in df.columns:
+            result[dst] = pd.to_numeric(df[src].values, errors="coerce")
+
+    # Max odds = same as B365 (user only uses Bet365)
+    for src_dst in [("Home_Odds", "Max_Home_Odds"),
+                    ("Draw_Odds", "Max_Draw_Odds"),
+                    ("Away_Odds", "Max_Away_Odds")]:
+        if src_dst[0] in result.columns:
+            result[src_dst[1]] = result[src_dst[0]]
 
     # Market average odds
     for suffix, dst in [("H", "Avg_Home_Odds"), ("D", "Avg_Draw_Odds"), ("A", "Avg_Away_Odds")]:

@@ -170,8 +170,10 @@ class ValueTab(QWidget):
 
         layout.addWidget(config_group)
 
-        # ── Odds API key row ─────────────────────────────────────────
-        odds_group = QGroupBox("Live Odds (the-odds-api.com — free, 500 req/month)")
+        # ── Odds source row ──────────────────────────────────────────
+        odds_group = QGroupBox(
+            "Live Odds — Bet365 from football-data.co.uk + the-odds-api.com (free, 500 req/month)"
+        )
         odds_layout = QHBoxLayout(odds_group)
         odds_layout.setSpacing(6)
 
@@ -473,15 +475,36 @@ class ValueTab(QWidget):
         can still predict those matches.
         """
         api_key = self.api_key_edit.text().strip()
+        has_b365_from_csv = (
+            not fixtures_df.empty
+            and "Home_Odds" in fixtures_df.columns
+            and fixtures_df["Home_Odds"].notna().any()
+        )
+        n_csv_odds = int(fixtures_df["Home_Odds"].notna().sum()) if has_b365_from_csv else 0
+
         if not api_key:
-            self.odds_status.setText("No API key — skipping live odds")
-            self.odds_status.setStyleSheet("color: #fbbf24; font-size: 11px;")
+            if has_b365_from_csv:
+                self.odds_status.setText(
+                    f"No API key — using Bet365 odds from football-data.co.uk "
+                    f"({n_csv_odds} fixtures)"
+                )
+                self.odds_status.setStyleSheet("color: #22c55e; font-size: 11px;")
+            else:
+                self.odds_status.setText("No API key — no odds available")
+                self.odds_status.setStyleSheet("color: #fbbf24; font-size: 11px;")
             return fixtures_df
 
         sport = get_sport_key(league_code)
         if not sport:
-            self.odds_status.setText(f"League {league_code} not supported by odds API")
-            self.odds_status.setStyleSheet("color: #fbbf24; font-size: 11px;")
+            if has_b365_from_csv:
+                self.odds_status.setText(
+                    f"League not on odds API — using Bet365 from football-data.co.uk "
+                    f"({n_csv_odds} fixtures)"
+                )
+                self.odds_status.setStyleSheet("color: #22c55e; font-size: 11px;")
+            else:
+                self.odds_status.setText(f"League {league_code} not supported by odds API")
+                self.odds_status.setStyleSheet("color: #fbbf24; font-size: 11px;")
             return fixtures_df
 
         try:
@@ -496,19 +519,36 @@ class ValueTab(QWidget):
             source = result.get("source", bookmaker)
 
             if not odds_data:
-                if raw_events == 0:
+                # Check if fixtures already have B365 odds from football-data.co.uk
+                has_existing = (
+                    not fixtures_df.empty
+                    and "Home_Odds" in fixtures_df.columns
+                    and fixtures_df["Home_Odds"].notna().any()
+                )
+                if has_existing:
+                    n_existing = int(fixtures_df["Home_Odds"].notna().sum())
+                    msg = (
+                        f"{source}  |  "
+                        f"Using Bet365 odds from football-data.co.uk "
+                        f"({n_existing} fixtures)  |  API calls left: {remaining}"
+                    )
+                    self.odds_status.setText(msg)
+                    self.odds_status.setStyleSheet("color: #22c55e; font-size: 11px;")
+                elif raw_events == 0:
                     msg = (
                         "API returned 0 events — no upcoming matches "
                         "for this league right now"
                     )
+                    self.odds_status.setText(msg)
+                    self.odds_status.setStyleSheet("color: #fbbf24; font-size: 11px;")
                 else:
                     msg = (
-                        f"API returned {raw_events} events but could not "
-                        f"extract odds — check API key / bookmaker selection  |  "
+                        f"{source}  |  "
+                        f"No Bet365 odds available from any source  |  "
                         f"API calls left: {remaining}"
                     )
-                self.odds_status.setText(msg)
-                self.odds_status.setStyleSheet("color: #fbbf24; font-size: 11px;")
+                    self.odds_status.setText(msg)
+                    self.odds_status.setStyleSheet("color: #fbbf24; font-size: 11px;")
                 return fixtures_df
 
             # If we have no fixtures at all, create them from odds data.
@@ -587,12 +627,26 @@ class ValueTab(QWidget):
             return updated
 
         except ValueError as e:
-            self.odds_status.setText(str(e))
-            self.odds_status.setStyleSheet("color: #ef4444; font-size: 11px;")
+            if has_b365_from_csv:
+                self.odds_status.setText(
+                    f"API error: {e}  |  Using Bet365 from football-data.co.uk "
+                    f"({n_csv_odds} fixtures)"
+                )
+                self.odds_status.setStyleSheet("color: #fbbf24; font-size: 11px;")
+            else:
+                self.odds_status.setText(str(e))
+                self.odds_status.setStyleSheet("color: #ef4444; font-size: 11px;")
             return fixtures_df
         except Exception as e:
-            self.odds_status.setText(f"Odds fetch failed: {e}")
-            self.odds_status.setStyleSheet("color: #ef4444; font-size: 11px;")
+            if has_b365_from_csv:
+                self.odds_status.setText(
+                    f"Odds API failed — using Bet365 from football-data.co.uk "
+                    f"({n_csv_odds} fixtures)"
+                )
+                self.odds_status.setStyleSheet("color: #fbbf24; font-size: 11px;")
+            else:
+                self.odds_status.setText(f"Odds fetch failed: {e}")
+                self.odds_status.setStyleSheet("color: #ef4444; font-size: 11px;")
             return fixtures_df
 
     def _on_run(self):
