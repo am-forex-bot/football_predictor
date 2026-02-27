@@ -91,9 +91,13 @@ def clean_results(raw_df: pd.DataFrame) -> pd.DataFrame:
         else:
             result[dst] = float("nan")
 
-    # Best available odds across all bookmakers (what a real punter shops for)
-    for suffix, dst in [("H", "Max_Home_Odds"), ("D", "Max_Draw_Odds"), ("A", "Max_Away_Odds")]:
-        result[dst] = _best_odds(df, suffix).values
+    # Max odds — set to Bet365 (same as Home_Odds) so value calculations
+    # and backtests use the odds the user can actually get, not inflated
+    # best-across-all-bookmakers prices they can't bet on.
+    for src_dst in [("Home_Odds", "Max_Home_Odds"),
+                    ("Draw_Odds", "Max_Draw_Odds"),
+                    ("Away_Odds", "Max_Away_Odds")]:
+        result[src_dst[1]] = result[src_dst[0]]
 
     # Market average odds
     for suffix, dst in [("H", "Avg_Home_Odds"), ("D", "Avg_Draw_Odds"), ("A", "Avg_Away_Odds")]:

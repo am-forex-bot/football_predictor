@@ -320,8 +320,8 @@ class ValueEngine:
         ]
 
         for market_name, model_prob, b365_odds, max_odds in markets_1x2:
-            # Use max odds for value calculation (best available price)
-            best_odds = max_odds or b365_odds
+            # Use the bookmaker odds (b365 from live API / historical data)
+            best_odds = b365_odds or max_odds
             if best_odds is None or best_odds < cfg.min_odds or best_odds > cfg.max_odds:
                 continue
 

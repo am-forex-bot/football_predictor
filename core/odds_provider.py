@@ -482,15 +482,17 @@ def fetch_odds(league_code: str, api_key: str,
         log.info("  First event: %s vs %s, %d bookmakers",
                  sample.get("home_team"), sample.get("away_team"), n_bm)
 
-    # Try target bookmaker first; fall back to best available
+    # Use target bookmaker only — don't fall back to other bookmakers
+    # the user can't actually bet on
     odds = _parse_odds(data, bm_key)
     source = bookmaker
 
     if not odds and bm_key:
-        # Target bookmaker has no odds — try all bookmakers
+        # Target bookmaker not in API response. Try without filter
+        # but tag each fixture so the user knows these aren't their bookie.
         odds = _parse_odds(data, "")
         if odds:
-            source = "best available (target bookmaker not found)"
+            source = f"{bookmaker} not found — showing best available (CHECK PRICES)"
 
     log.info("Parsed %d fixtures with odds (source: %s)", len(odds), source)
 
