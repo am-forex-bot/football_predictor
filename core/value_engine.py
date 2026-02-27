@@ -431,6 +431,46 @@ class ValueEngine:
                 "confidence": _rate_confidence(edge, model_prob),
             })
 
+        # ── Additional Goal Lines (O/U 1.5, 3.5) ───────────────────
+        extra_lines = [
+            ("Over 1.5", pred.get("p_over_15", 0), pred.get("over_15_odds")),
+            ("Under 1.5", pred.get("p_under_15", 0), pred.get("under_15_odds")),
+            ("Over 3.5", pred.get("p_over_35", 0), pred.get("over_35_odds")),
+            ("Under 3.5", pred.get("p_under_35", 0), pred.get("under_35_odds")),
+        ]
+
+        for market_name, model_prob, odds in extra_lines:
+            if odds is None or model_prob <= 0:
+                continue
+            edge = calculate_edge(model_prob, odds)
+            if edge < cfg.min_edge:
+                continue
+
+            stake = kelly_stake(
+                model_prob, odds, cfg.current_balance,
+                cfg.kelly_fraction, cfg.max_stake_pct,
+            )
+            stake = max(cfg.min_stake, min(stake, cfg.max_stake))
+            ev = expected_value(model_prob, odds, stake)
+
+            bets.append({
+                "date": date,
+                "home_team": home,
+                "away_team": away,
+                "market": "Goals",
+                "selection": market_name,
+                "model_prob": round(model_prob * 100, 1),
+                "b365_odds": odds,
+                "best_odds": odds,
+                "implied_prob": round(odds_to_prob(odds) * 100, 1),
+                "edge": round(edge * 100, 1),
+                "kelly_stake": round(stake, 2),
+                "expected_value": round(ev, 2),
+                "home_xg": pred["home_xg"],
+                "away_xg": pred["away_xg"],
+                "confidence": _rate_confidence(edge, model_prob),
+            })
+
         return bets
 
     def record_bet_result(self, bet: dict, won: bool, actual_odds: float = 0):

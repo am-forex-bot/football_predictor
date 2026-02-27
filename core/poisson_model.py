@@ -211,28 +211,98 @@ class PoissonModel:
         # Build probability matrix
         matrix = _build_goal_matrix(home_xg, away_xg)
 
-        # Derive probabilities
-        p_home = 0.0
-        p_draw = 0.0
-        p_away = 0.0
-        p_over_25 = 0.0
+        # ── Derive ALL probabilities from the goal matrix in one pass ──
+        # Basic markets
+        p_home = p_draw = p_away = 0.0
+        p_over_15 = p_over_25 = p_over_35 = p_over_45 = 0.0
         p_btts = 0.0
+
+        # Combo: BTTS + Result
+        p_btts_home = p_btts_draw = p_btts_away = 0.0
+
+        # Combo: Result + Over/Under 2.5
+        p_home_o25 = p_draw_o25 = p_away_o25 = 0.0
+        p_home_u25 = p_draw_u25 = p_away_u25 = 0.0
+
+        # Combo: BTTS + Over/Under 2.5
+        p_btts_o25 = p_btts_u25 = 0.0
+
+        # Team totals
+        p_home_over_05 = p_home_over_15 = p_home_over_25 = 0.0
+        p_away_over_05 = p_away_over_15 = p_away_over_25 = 0.0
 
         for i in range(MAX_GOALS):
             for j in range(MAX_GOALS):
                 p = matrix[i, j]
-                if i > j:
+                total = i + j
+                hw = i > j
+                dr = i == j
+                aw = i < j
+                btts = (i >= 1 and j >= 1)
+
+                # 1X2
+                if hw:
                     p_home += p
-                elif i == j:
+                elif dr:
                     p_draw += p
                 else:
                     p_away += p
 
-                if i + j > 2:
+                # Goal lines
+                if total > 1:
+                    p_over_15 += p
+                if total > 2:
                     p_over_25 += p
+                if total > 3:
+                    p_over_35 += p
+                if total > 4:
+                    p_over_45 += p
 
-                if i >= 1 and j >= 1:
+                # BTTS
+                if btts:
                     p_btts += p
+
+                # BTTS + Result
+                if btts and hw:
+                    p_btts_home += p
+                if btts and dr:
+                    p_btts_draw += p
+                if btts and aw:
+                    p_btts_away += p
+
+                # Result + O/U 2.5
+                if hw and total > 2:
+                    p_home_o25 += p
+                if dr and total > 2:
+                    p_draw_o25 += p
+                if aw and total > 2:
+                    p_away_o25 += p
+                if hw and total <= 2:
+                    p_home_u25 += p
+                if dr and total <= 2:
+                    p_draw_u25 += p
+                if aw and total <= 2:
+                    p_away_u25 += p
+
+                # BTTS + O/U 2.5
+                if btts and total > 2:
+                    p_btts_o25 += p
+                if btts and total <= 2:
+                    p_btts_u25 += p
+
+                # Team totals
+                if i >= 1:
+                    p_home_over_05 += p
+                if i >= 2:
+                    p_home_over_15 += p
+                if i >= 3:
+                    p_home_over_25 += p
+                if j >= 1:
+                    p_away_over_05 += p
+                if j >= 2:
+                    p_away_over_15 += p
+                if j >= 3:
+                    p_away_over_25 += p
 
         # Top correct scores
         correct_scores = {}
@@ -245,18 +315,65 @@ class PoissonModel:
         correct_scores = dict(sorted(correct_scores.items(),
                                       key=lambda x: x[1], reverse=True)[:8])
 
+        def _r(v: float) -> float:
+            return round(v, 4)
+
         return {
             "home_team": home_team,
             "away_team": away_team,
             "home_xg": round(home_xg, 2),
             "away_xg": round(away_xg, 2),
-            "p_home": round(p_home, 4),
-            "p_draw": round(p_draw, 4),
-            "p_away": round(p_away, 4),
-            "p_over_25": round(p_over_25, 4),
-            "p_under_25": round(1 - p_over_25, 4),
-            "p_btts_yes": round(p_btts, 4),
-            "p_btts_no": round(1 - p_btts, 4),
+
+            # 1X2
+            "p_home": _r(p_home),
+            "p_draw": _r(p_draw),
+            "p_away": _r(p_away),
+
+            # Goal lines
+            "p_over_15": _r(p_over_15),
+            "p_under_15": _r(1 - p_over_15),
+            "p_over_25": _r(p_over_25),
+            "p_under_25": _r(1 - p_over_25),
+            "p_over_35": _r(p_over_35),
+            "p_under_35": _r(1 - p_over_35),
+            "p_over_45": _r(p_over_45),
+            "p_under_45": _r(1 - p_over_45),
+
+            # BTTS
+            "p_btts_yes": _r(p_btts),
+            "p_btts_no": _r(1 - p_btts),
+
+            # Combos: BTTS + Result
+            "p_btts_home": _r(p_btts_home),
+            "p_btts_draw": _r(p_btts_draw),
+            "p_btts_away": _r(p_btts_away),
+
+            # Combos: Result + Over/Under 2.5
+            "p_home_o25": _r(p_home_o25),
+            "p_home_u25": _r(p_home_u25),
+            "p_draw_o25": _r(p_draw_o25),
+            "p_draw_u25": _r(p_draw_u25),
+            "p_away_o25": _r(p_away_o25),
+            "p_away_u25": _r(p_away_u25),
+
+            # Combos: BTTS + Over/Under 2.5
+            "p_btts_o25": _r(p_btts_o25),
+            "p_btts_u25": _r(p_btts_u25),
+
+            # Team totals
+            "p_home_over_05": _r(p_home_over_05),
+            "p_home_under_05": _r(1 - p_home_over_05),
+            "p_home_over_15": _r(p_home_over_15),
+            "p_home_under_15": _r(1 - p_home_over_15),
+            "p_home_over_25": _r(p_home_over_25),
+            "p_home_under_25": _r(1 - p_home_over_25),
+            "p_away_over_05": _r(p_away_over_05),
+            "p_away_under_05": _r(1 - p_away_over_05),
+            "p_away_over_15": _r(p_away_over_15),
+            "p_away_under_15": _r(1 - p_away_over_15),
+            "p_away_over_25": _r(p_away_over_25),
+            "p_away_under_25": _r(1 - p_away_over_25),
+
             "correct_scores": correct_scores,
             "matrix": matrix,
         }

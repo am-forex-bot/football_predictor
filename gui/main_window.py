@@ -8,6 +8,7 @@ from gui.prediction_tab import PredictionTab
 from gui.backtest_tab import BacktestTab
 from gui.tuner_tab import TunerTab
 from gui.value_tab import ValueTab
+from gui.bet_builder_tab import BetBuilderTab
 
 
 class MainWindow(QMainWindow):
@@ -33,10 +34,12 @@ class MainWindow(QMainWindow):
         self.backtest_tab = BacktestTab(self)
         self.tuner_tab = TunerTab(self)
         self.value_tab = ValueTab(self)
+        self.bet_builder_tab = BetBuilderTab(self)
 
         self.tabs.addTab(self.download_tab, "  Download  ")
         self.tabs.addTab(self.prediction_tab, "  Predict  ")
         self.tabs.addTab(self.value_tab, "  Value Bets  ")
+        self.tabs.addTab(self.bet_builder_tab, "  Bet Builder  ")
         self.tabs.addTab(self.backtest_tab, "  Backtest  ")
         self.tabs.addTab(self.tuner_tab, "  Tune Weights  ")
 
@@ -52,6 +55,8 @@ class MainWindow(QMainWindow):
         elif index == 2:
             self.value_tab.refresh_leagues()
         elif index == 3:
-            self.backtest_tab.refresh_leagues()
+            self.bet_builder_tab.refresh_leagues()
         elif index == 4:
+            self.backtest_tab.refresh_leagues()
+        elif index == 5:
             self.tuner_tab.refresh_leagues()

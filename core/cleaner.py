@@ -106,6 +106,19 @@ def clean_results(raw_df: pd.DataFrame) -> pd.DataFrame:
         else:
             result[dst] = float("nan")
 
+    # Match stats (shots, corners, cards) — available on most football-data.co.uk files
+    stat_cols = [
+        ("HS", "Home_Shots"), ("AS", "Away_Shots"),
+        ("HST", "Home_SOT"), ("AST", "Away_SOT"),
+        ("HC", "Home_Corners"), ("AC", "Away_Corners"),
+        ("HF", "Home_Fouls"), ("AF", "Away_Fouls"),
+        ("HY", "Home_Yellows"), ("AY", "Away_Yellows"),
+        ("HR", "Home_Reds"), ("AR", "Away_Reds"),
+    ]
+    for src, dst in stat_cols:
+        if src in df.columns:
+            result[dst] = pd.to_numeric(df[src], errors="coerce")
+
     return result.reset_index(drop=True)
 
 
