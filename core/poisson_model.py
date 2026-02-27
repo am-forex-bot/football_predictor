@@ -324,7 +324,9 @@ class PoissonModel:
                              ("Max_Draw_Odds", "max_draw"),
                              ("Max_Away_Odds", "max_away"),
                              ("Over_25_Odds", "over_25_odds"),
-                             ("Under_25_Odds", "under_25_odds")]:
+                             ("Under_25_Odds", "under_25_odds"),
+                             ("BTTS_Yes_Odds", "btts_yes_odds"),
+                             ("BTTS_No_Odds", "btts_no_odds")]:
                 val = fix.get(src, float("nan"))
                 pred[dst] = float(val) if pd.notna(val) and val > 0 else None
 

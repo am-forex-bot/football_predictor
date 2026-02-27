@@ -530,6 +530,8 @@ class ValueTab(QWidget):
                         "Max_Away_Odds": o["away_odds"],
                         "Over_25_Odds": o.get("over_25_odds"),
                         "Under_25_Odds": o.get("under_25_odds"),
+                        "BTTS_Yes_Odds": o.get("btts_yes_odds"),
+                        "BTTS_No_Odds": o.get("btts_no_odds"),
                     })
                 updated = pd.DataFrame(rows)
                 n_with_odds = len(rows)
@@ -560,6 +562,8 @@ class ValueTab(QWidget):
                             "Max_Away_Odds": o["away_odds"],
                             "Over_25_Odds": o.get("over_25_odds"),
                             "Under_25_Odds": o.get("under_25_odds"),
+                            "BTTS_Yes_Odds": o.get("btts_yes_odds"),
+                            "BTTS_No_Odds": o.get("btts_no_odds"),
                         })
                     odds_fixtures = pd.DataFrame(rows)
                     updated = pd.concat([updated, odds_fixtures], ignore_index=True)

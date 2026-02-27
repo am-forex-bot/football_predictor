@@ -443,7 +443,7 @@ def fetch_odds(league_code: str, api_key: str,
         f"{_BASE}/sports/{sport}/odds/"
         f"?apiKey={key}"
         f"&regions=uk,eu"
-        f"&markets=h2h,totals"
+        f"&markets=h2h,totals,btts"
         f"&oddsFormat=decimal"
     )
     req = requests.Request("GET", url)
@@ -518,6 +518,8 @@ def _parse_odds(events: list, target_bm: str = "") -> list[dict]:
         h2h = {"home": None, "draw": None, "away": None}
         # Over/Under 2.5
         ou25 = {"over": None, "under": None}
+        # BTTS (Both Teams To Score)
+        btts = {"yes": None, "no": None}
         # Which bookmaker provided the h2h odds
         h2h_source = ""
 
@@ -556,6 +558,15 @@ def _parse_odds(events: list, target_bm: str = "") -> list[dict]:
                                 if ou25["under"] is None or o["price"] > ou25["under"]:
                                     ou25["under"] = o["price"]
 
+                elif mkey == "btts":
+                    for o in market.get("outcomes", []):
+                        if o["name"] == "Yes":
+                            if btts["yes"] is None or o["price"] > btts["yes"]:
+                                btts["yes"] = o["price"]
+                        elif o["name"] == "No":
+                            if btts["no"] is None or o["price"] > btts["no"]:
+                                btts["no"] = o["price"]
+
         if h2h["home"] is None:
             continue
 
@@ -570,6 +581,8 @@ def _parse_odds(events: list, target_bm: str = "") -> list[dict]:
             "away_odds": h2h["away"],
             "over_25_odds": ou25["over"],
             "under_25_odds": ou25["under"],
+            "btts_yes_odds": btts["yes"],
+            "btts_no_odds": btts["no"],
             "bookmaker": h2h_source,
         })
 
@@ -637,7 +650,8 @@ def merge_odds_into_fixtures(fixtures_df: pd.DataFrame,
     # Ensure odds columns exist
     for col in ("Home_Odds", "Draw_Odds", "Away_Odds",
                 "Max_Home_Odds", "Max_Draw_Odds", "Max_Away_Odds",
-                "Over_25_Odds", "Under_25_Odds"):
+                "Over_25_Odds", "Under_25_Odds",
+                "BTTS_Yes_Odds", "BTTS_No_Odds"):
         if col not in df.columns:
             df[col] = float("nan")
 
@@ -668,6 +682,12 @@ def merge_odds_into_fixtures(fixtures_df: pd.DataFrame,
             df.at[idx, "Over_25_Odds"] = o["over_25_odds"]
         if o.get("under_25_odds"):
             df.at[idx, "Under_25_Odds"] = o["under_25_odds"]
+
+        # BTTS
+        if o.get("btts_yes_odds"):
+            df.at[idx, "BTTS_Yes_Odds"] = o["btts_yes_odds"]
+        if o.get("btts_no_odds"):
+            df.at[idx, "BTTS_No_Odds"] = o["btts_no_odds"]
 
     log.info("merge_odds: matched %d / %d fixtures", matched, len(df))
     return df

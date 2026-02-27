@@ -395,8 +395,8 @@ class ValueEngine:
 
         # ── BTTS Market ──────────────────────────────────────────────
         btts_markets = [
-            ("BTTS Yes", pred["p_btts_yes"], None),
-            ("BTTS No", pred["p_btts_no"], None),
+            ("BTTS Yes", pred["p_btts_yes"], pred.get("btts_yes_odds")),
+            ("BTTS No", pred["p_btts_no"], pred.get("btts_no_odds")),
         ]
 
         for market_name, model_prob, odds in btts_markets:
