@@ -443,7 +443,7 @@ def fetch_odds(league_code: str, api_key: str,
         f"{_BASE}/sports/{sport}/odds/"
         f"?apiKey={key}"
         f"&regions=uk,eu"
-        f"&markets=h2h,totals,btts"
+        f"&markets=h2h,totals"
         f"&oddsFormat=decimal"
     )
     req = requests.Request("GET", url)
@@ -460,7 +460,14 @@ def fetch_odds(league_code: str, api_key: str,
     if resp.status_code == 429:
         raise ValueError("API quota exceeded. Free tier = 500 requests/month.")
     if resp.status_code == 422:
-        raise ValueError(f"League '{sport}' not currently available on the-odds-api.")
+        detail = ""
+        try:
+            detail = resp.json().get("message", resp.text[:200])
+        except Exception:
+            detail = resp.text[:200]
+        raise ValueError(
+            f"the-odds-api rejected request for '{sport}': {detail}"
+        )
     resp.raise_for_status()
 
     data = resp.json()
