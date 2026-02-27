@@ -482,17 +482,35 @@ def fetch_odds(league_code: str, api_key: str,
         log.info("  First event: %s vs %s, %d bookmakers",
                  sample.get("home_team"), sample.get("away_team"), n_bm)
 
-    # Use target bookmaker only — don't fall back to other bookmakers
-    # the user can't actually bet on
+    # Use target bookmaker only — never fall back to other bookmakers
     odds = _parse_odds(data, bm_key)
     source = bookmaker
 
     if not odds and bm_key:
-        # Target bookmaker not in API response. Try without filter
-        # but tag each fixture so the user knows these aren't their bookie.
-        odds = _parse_odds(data, "")
-        if odds:
-            source = f"{bookmaker} not found — showing best available (CHECK PRICES)"
+        # Log what bookmakers ARE in the response so we can debug
+        all_bm_keys = set()
+        for event in data:
+            for bm in event.get("bookmakers", []):
+                all_bm_keys.add(bm.get("key", ""))
+        log.warning("Target bookmaker '%s' not found. Available: %s",
+                    bm_key, sorted(all_bm_keys))
+
+        # Try flexible matching: case-insensitive, partial match
+        matched_key = ""
+        for k in sorted(all_bm_keys):
+            if bm_key.lower() in k.lower() or k.lower() in bm_key.lower():
+                matched_key = k
+                break
+        if matched_key:
+            log.info("Flexible match: '%s' → '%s'", bm_key, matched_key)
+            odds = _parse_odds(data, matched_key)
+            source = f"{bookmaker} (matched as '{matched_key}')"
+        else:
+            # No match at all — return no odds rather than fake prices
+            source = (
+                f"{bookmaker} not available on API. "
+                f"Available: {', '.join(sorted(all_bm_keys)[:8])}"
+            )
 
     log.info("Parsed %d fixtures with odds (source: %s)", len(odds), source)
 

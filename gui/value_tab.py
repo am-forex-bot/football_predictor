@@ -251,7 +251,7 @@ class ValueTab(QWidget):
         self.vb_table = QTableWidget()
         cols = [
             "Match", "Market", "Selection", "Model %", "Implied %",
-            "Edge %", "Best Odds", "Kelly Stake", "EV (£)", "xG",
+            "Edge %", "Bet365 Odds", "Kelly Stake", "EV (£)", "xG",
             "Confidence",
         ]
         self.vb_table.setColumnCount(len(cols))
