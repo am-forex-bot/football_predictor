@@ -1,9 +1,12 @@
 """Transform raw football-data.co.uk CSV data into the clean format
 used by the prediction engine."""
 
+import logging
 import os
 
 import pandas as pd
+
+log = logging.getLogger(__name__)
 
 
 def _best_odds(df: pd.DataFrame, suffix: str) -> pd.Series:
@@ -126,18 +129,90 @@ def clean_results(raw_df: pd.DataFrame) -> pd.DataFrame:
     return result.reset_index(drop=True)
 
 
-def extract_fixtures(raw_df: pd.DataFrame) -> pd.DataFrame:
+def _detect_column_shift(raw_df: pd.DataFrame) -> bool:
+    """Detect if football-data.co.uk CSV has column misalignment.
+
+    This happens when the fixtures.csv has one fewer empty field than the header
+    expects (e.g. FTHG and FTAG are empty but FTR's empty field is missing).
+    Result: FTR gets the B365H value, all subsequent columns shift left by 1.
+
+    Returns True if the FTR column appears to contain odds values (float > 1.0)
+    rather than match results ('H', 'D', 'A').
+    """
+    if "FTR" not in raw_df.columns:
+        return False
+
+    ftr = raw_df["FTR"]
+    # Valid FTR values are: NaN, '', 'H', 'D', 'A'
+    # If FTR has float values > 1.0, it's probably B365H (column shift)
+    ftr_numeric = pd.to_numeric(ftr, errors="coerce")
+    n_numeric = ftr_numeric.notna().sum()
+    if n_numeric == 0:
+        return False
+
+    # If any FTR value is numeric and > 1.0, it's likely odds, not a result
+    if (ftr_numeric > 1.0).any():
+        return True
+
+    return False
+
+
+def _fix_column_shift(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """Fix column shift in football-data.co.uk fixtures.csv.
+
+    When the CSV is missing one empty field (FTR), all columns from FTR onwards
+    are shifted left by 1. Fix by inserting a NaN FTR and shifting data right.
+    """
+    df = raw_df.copy()
+    cols = list(df.columns)
+
+    try:
+        ftr_idx = cols.index("FTR")
+    except ValueError:
+        return df
+
+    # The current FTR column has what should be in the NEXT column (B365H).
+    # Shift: save current values, then shift each column right by 1 from FTR.
+    shifted_cols = cols[ftr_idx:]  # FTR, B365H, B365D, B365A, ...
+
+    # Shift values: col[n] gets col[n-1]'s values, from right to left
+    for i in range(len(shifted_cols) - 1, 0, -1):
+        df[shifted_cols[i]] = df[shifted_cols[i - 1]].values
+
+    # FTR itself becomes NaN (it's a fixture, no result)
+    df["FTR"] = float("nan")
+
+    return df
+
+
+def extract_fixtures(raw_df: pd.DataFrame,
+                     all_are_fixtures: bool = False) -> pd.DataFrame:
     """Extract upcoming fixtures (rows where FTR is NaN but teams exist).
 
     Handles both formats:
     - Season CSV: has FTR column, fixtures are rows where FTR is empty
     - Dedicated fixtures.csv: may not have FTR at all, all rows are fixtures
 
+    Args:
+        all_are_fixtures: If True, treat ALL rows as fixtures (skip FTR check).
+            Use this when the input is from a dedicated fixtures source.
+
     Prefers future-dated matches, but falls back to all unresulted matches
     if no future fixtures exist yet (e.g. when results haven't been updated).
     """
     if raw_df.empty:
         return pd.DataFrame(columns=["Team", "Opponent"])
+
+    # Detect and fix column misalignment in football-data fixtures.csv.
+    # This happens when the CSV has one fewer empty field than the header,
+    # causing FTR to get the B365H value and all odds to shift left.
+    if _detect_column_shift(raw_df):
+        log.warning("Column shift detected: FTR has odds values (e.g. %s). "
+                    "Fixing alignment.",
+                    raw_df["FTR"].dropna().head(3).tolist())
+        raw_df = _fix_column_shift(raw_df)
+        # After fix, all rows are fixtures (FTR is now NaN)
+        all_are_fixtures = True
 
     # Determine home/away column names
     if "HomeTeam" in raw_df.columns:
@@ -147,7 +222,10 @@ def extract_fixtures(raw_df: pd.DataFrame) -> pd.DataFrame:
     else:
         return pd.DataFrame(columns=["Team", "Opponent"])
 
-    if "FTR" in raw_df.columns:
+    has_ftr = "FTR" in raw_df.columns
+    if all_are_fixtures:
+        mask = pd.Series(True, index=raw_df.index)
+    elif has_ftr:
         mask = raw_df["FTR"].isna() | (raw_df["FTR"] == "")
     else:
         # No FTR column = all rows are fixtures
@@ -156,6 +234,22 @@ def extract_fixtures(raw_df: pd.DataFrame) -> pd.DataFrame:
     mask &= raw_df[home_col].notna()
     mask &= raw_df[away_col].notna()
     df = raw_df.loc[mask].copy()
+
+    b365_present = "B365H" in df.columns
+    n_b365_before = int(df["B365H"].notna().sum()) if b365_present else 0
+    log.info("extract_fixtures: %d rows selected (all_fixtures=%s, FTR col=%s), "
+             "B365H=%s (%d non-null)",
+             len(df), all_are_fixtures, has_ftr, b365_present, n_b365_before)
+
+    # Safety check: if FTR filter excluded everything but B365 data exists
+    # in the original df, we likely have a column issue — retry without FTR
+    if len(df) == 0 and not all_are_fixtures and "B365H" in raw_df.columns:
+        n_raw_b365 = int(raw_df["B365H"].notna().sum())
+        if n_raw_b365 > 0:
+            log.warning("FTR filter excluded ALL rows but B365H has %d values. "
+                        "Retrying without FTR filter.", n_raw_b365)
+            mask = raw_df[home_col].notna() & raw_df[away_col].notna()
+            df = raw_df.loc[mask].copy()
 
     # Try to filter to future-only matches
     date_col = None
@@ -170,6 +264,10 @@ def extract_fixtures(raw_df: pd.DataFrame) -> pd.DataFrame:
         tomorrow = pd.Timestamp.now().normalize() + pd.Timedelta(days=1)
         future_mask = dates.isna() | (dates >= tomorrow)
         future_df = df.loc[future_mask]
+
+        n_b365_future = int(future_df["B365H"].notna().sum()) if b365_present and not future_df.empty else 0
+        log.info("extract_fixtures: %d future rows (of %d), B365H non-null=%d",
+                 len(future_df), len(df), n_b365_future)
 
         if len(future_df) > 0:
             # We have genuine future fixtures — use only those
@@ -208,6 +306,10 @@ def extract_fixtures(raw_df: pd.DataFrame) -> pd.DataFrame:
     # Market average odds
     for suffix, dst in [("H", "Avg_Home_Odds"), ("D", "Avg_Draw_Odds"), ("A", "Avg_Away_Odds")]:
         result[dst] = _avg_odds(df, suffix).values
+
+    n_home_odds = int(result["Home_Odds"].notna().sum()) if "Home_Odds" in result.columns else 0
+    log.info("extract_fixtures: result has %d rows, %d with Home_Odds",
+             len(result), n_home_odds)
 
     return result.reset_index(drop=True)
 
@@ -380,13 +482,32 @@ def process_and_save(raw_df: pd.DataFrame, fixtures_raw_df: pd.DataFrame | None,
 
     # Fixtures from the dedicated fixtures.csv (if provided)
     if fixtures_raw_df is not None and not fixtures_raw_df.empty:
-        fixtures_extra = extract_fixtures(fixtures_raw_df)
+        # Log incoming data to diagnose odds pipeline
+        b365_in_raw = "B365H" in fixtures_raw_df.columns
+        n_b365_raw = int(fixtures_raw_df["B365H"].notna().sum()) if b365_in_raw else 0
+        log.info("process_and_save: fixtures_raw_df has %d rows, B365H present=%s, "
+                 "B365H non-null=%d, columns=%s",
+                 len(fixtures_raw_df), b365_in_raw, n_b365_raw,
+                 [c for c in fixtures_raw_df.columns if "B365" in str(c) or "Home" in str(c)])
+
+        fixtures_extra = extract_fixtures(fixtures_raw_df, all_are_fixtures=True)
+
+        odds_in_extra = "Home_Odds" in fixtures_extra.columns
+        n_odds_extra = int(fixtures_extra["Home_Odds"].notna().sum()) if odds_in_extra else 0
+        log.info("process_and_save: after extract_fixtures → %d rows, "
+                 "Home_Odds present=%s, Home_Odds non-null=%d",
+                 len(fixtures_extra), odds_in_extra, n_odds_extra)
+
         # Merge and deduplicate — put fixtures_extra FIRST because it has
         # Bet365 odds from football-data.co.uk fixtures.csv.
         # drop_duplicates keeps the first occurrence, so the version WITH
         # odds wins over the season CSV version (which has no odds).
         fixtures = pd.concat([fixtures_extra, fixtures_from_csv], ignore_index=True)
         fixtures = fixtures.drop_duplicates(subset=["Team", "Opponent"]).reset_index(drop=True)
+
+        # Final check
+        n_final = int(fixtures["Home_Odds"].notna().sum()) if "Home_Odds" in fixtures.columns else 0
+        log.info("process_and_save: final fixtures=%d, Home_Odds non-null=%d", len(fixtures), n_final)
     else:
         fixtures = fixtures_from_csv
 

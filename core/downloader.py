@@ -1,11 +1,12 @@
 """Download match data from football-data.co.uk and fixtures from openfootball.
 
 Results come from football-data.co.uk season CSVs.
-Fixtures (upcoming matches) come from openfootball/football.json on GitHub,
-with football-data.co.uk fixtures.csv as a fallback.
+Fixtures (upcoming matches) come from football-data.co.uk fixtures.csv
+(primary — includes Bet365 odds) supplemented by openfootball/football.json.
 """
 
 import json
+import logging
 import random
 import time
 from io import StringIO
@@ -13,6 +14,8 @@ from io import StringIO
 import pandas as pd
 import requests
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
+
+log = logging.getLogger(__name__)
 
 from core.leagues import (get_results_url, get_past_season_codes, season_display,
                          get_of_json, get_current_season_code, OPENFOOTBALL_TEAM_MAP)
@@ -87,36 +90,47 @@ def download_fixtures() -> pd.DataFrame:
 
 
 def _merge_fixtures_with_odds(of_df: pd.DataFrame, fd_df: pd.DataFrame) -> pd.DataFrame:
-    """Merge openfootball fixture list with football-data.co.uk odds.
+    """Merge football-data.co.uk fixtures (with Bet365 odds) and openfootball fixtures.
 
-    Openfootball provides comprehensive fixture lists but no bookmaker odds.
-    Football-data.co.uk fixtures.csv provides pre-match odds (B365, Max, etc.).
-    This merges odds into the openfootball fixtures where matches line up,
-    and includes any football-data fixtures not in openfootball.
+    Football-data.co.uk fixtures.csv is PRIMARY because it carries Bet365 odds
+    (B365H, B365D, B365A, B365>2.5, B365<2.5, etc.).
+    Openfootball supplements with additional fixtures not in football-data.
+
+    Previous approach used a LEFT join from openfootball, which silently lost
+    all Bet365 odds whenever team names didn't match perfectly between sources.
+    New approach: keep football-data rows intact, append openfootball extras.
     """
-    # Identify odds columns (everything except basic fixture metadata)
-    meta = {"Div", "Date", "HomeTeam", "AwayTeam", "FTR", "Time"}
-    odds_cols = [c for c in fd_df.columns if c not in meta]
-
-    if not odds_cols:
+    if fd_df.empty:
         return of_df
+    if of_df.empty:
+        return fd_df
 
-    # Left join: keep all openfootball fixtures, add odds where matched
-    fd_odds = fd_df[["HomeTeam", "AwayTeam"] + odds_cols].drop_duplicates(
-        subset=["HomeTeam", "AwayTeam"]
-    )
-    merged = of_df.merge(fd_odds, on=["HomeTeam", "AwayTeam"], how="left")
+    # Log what we're merging
+    b365_col = "B365H" if "B365H" in fd_df.columns else None
+    if b365_col:
+        n_with_odds = int(fd_df[b365_col].notna().sum())
+        log.info("Merge: football-data has %d/%d fixtures with B365 odds",
+                 n_with_odds, len(fd_df))
+    else:
+        log.info("Merge: football-data has %d fixtures but NO B365H column "
+                 "(columns: %s)", len(fd_df), list(fd_df.columns)[:10])
 
-    # Also include any football-data fixtures NOT in openfootball
-    of_keys = set(zip(of_df["HomeTeam"], of_df["AwayTeam"]))
-    fd_only = fd_df[
-        ~fd_df.apply(lambda r: (r["HomeTeam"], r["AwayTeam"]) in of_keys, axis=1)
+    # Football-data is primary (has odds) — keep ALL its rows intact
+    fd_keys = set(zip(fd_df["HomeTeam"], fd_df["AwayTeam"]))
+
+    # Find openfootball fixtures NOT already in football-data
+    of_only = of_df[
+        ~of_df.apply(
+            lambda r: (r["HomeTeam"], r["AwayTeam"]) in fd_keys, axis=1
+        )
     ]
 
-    if not fd_only.empty:
-        merged = pd.concat([merged, fd_only], ignore_index=True)
+    if not of_only.empty:
+        log.info("Merge: adding %d openfootball-only fixtures (no odds)", len(of_only))
+        return pd.concat([fd_df, of_only], ignore_index=True)
 
-    return merged
+    log.info("Merge: all openfootball fixtures already in football-data")
+    return fd_df
 
 
 def download_fixtures_openfootball(league_code: str) -> pd.DataFrame:
@@ -261,8 +275,8 @@ class DownloadWorker(QObject):
             except Exception as e:
                 self.progress.emit(f"  Warning: openfootball failed: {e}")
 
-            # Always try football-data.co.uk for bookmaker odds
-            self.progress.emit("Downloading odds from football-data.co.uk...")
+            # Always try football-data.co.uk for bookmaker odds (PRIMARY source)
+            self.progress.emit("Downloading Bet365 odds from football-data.co.uk...")
             fd_fixtures = pd.DataFrame()
             try:
                 all_fixtures = download_fixtures()
@@ -271,28 +285,35 @@ class DownloadWorker(QObject):
                         all_fixtures["Div"] == self.league_code
                     ].copy()
                     if not fd_fixtures.empty:
+                        # Report which B365 columns are present
+                        b365_cols = [c for c in fd_fixtures.columns if c.startswith("B365")]
+                        n_b365 = int(fd_fixtures["B365H"].notna().sum()) if "B365H" in fd_fixtures.columns else 0
                         self.progress.emit(
-                            f"  Odds: {len(fd_fixtures)} fixtures with bookmaker odds"
+                            f"  football-data: {len(fd_fixtures)} fixtures, "
+                            f"{n_b365} with B365 odds  "
+                            f"(columns: {', '.join(b365_cols) or 'none'})"
                         )
                     else:
-                        self.progress.emit("  No odds data for this league.")
+                        self.progress.emit("  No odds data for this league on football-data.")
                 else:
                     self.progress.emit("  Odds source: no Div column found.")
             except Exception as e:
-                self.progress.emit(f"  Odds download failed: {e}")
+                self.progress.emit(f"  football-data download failed: {e}")
 
-            # Merge: openfootball fixtures + football-data odds
-            if not of_fixtures.empty and not fd_fixtures.empty:
+            # Combine fixtures: football-data (with odds) is PRIMARY,
+            # openfootball supplements with extra fixtures.
+            if not fd_fixtures.empty and not of_fixtures.empty:
                 league_fixtures = _merge_fixtures_with_odds(of_fixtures, fd_fixtures)
-                n_with_odds = league_fixtures.iloc[:, 5:].notna().any(axis=1).sum()
+                n_b365 = int(league_fixtures["B365H"].notna().sum()) if "B365H" in league_fixtures.columns else 0
                 self.progress.emit(
-                    f"  Merged: {len(league_fixtures)} fixtures, "
-                    f"{n_with_odds} with bookmaker odds"
+                    f"  Combined: {len(league_fixtures)} total fixtures, "
+                    f"{n_b365} with Bet365 odds"
                 )
             elif not fd_fixtures.empty:
                 league_fixtures = fd_fixtures
+                n_b365 = int(fd_fixtures["B365H"].notna().sum()) if "B365H" in fd_fixtures.columns else 0
                 self.progress.emit(
-                    f"  Using {len(fd_fixtures)} football-data fixtures (with odds)"
+                    f"  Using {len(fd_fixtures)} football-data fixtures ({n_b365} with B365 odds)"
                 )
             elif not of_fixtures.empty:
                 league_fixtures = of_fixtures
