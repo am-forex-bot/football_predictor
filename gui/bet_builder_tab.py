@@ -170,6 +170,33 @@ class BetBuilderTab(QWidget):
             self.run_btn.setText("Build Markets")
             return
 
+        # If no fixtures in the workbook, generate all possible next-round
+        # matchups from the teams in the results data.  This ensures the
+        # Bet Builder always has something to show.
+        if fixtures_df is None or fixtures_df.empty:
+            teams = sorted(
+                set(results_df["Team"].unique()) | set(results_df["Opponent"].unique())
+            )
+            if len(teams) >= 2:
+                import pandas as pd
+                rows = []
+                # Generate round-robin home fixtures (each team hosts once)
+                for i, home in enumerate(teams):
+                    away = teams[(i + 1) % len(teams)]
+                    rows.append({"Team": home, "Opponent": away})
+                fixtures_df = pd.DataFrame(rows)
+                self.main_window.set_status(
+                    f"No fixtures in workbook — generated {len(rows)} "
+                    f"matchups from {len(teams)} teams"
+                )
+            else:
+                self.main_window.set_status(
+                    "No fixtures found. Download a league with upcoming matches first."
+                )
+                self.run_btn.setEnabled(True)
+                self.run_btn.setText("Build Markets")
+                return
+
         self._worker = _BetBuilderWorker(results_df, fixtures_df)
         self._worker.finished.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
