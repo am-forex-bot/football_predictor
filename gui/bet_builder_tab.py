@@ -126,14 +126,19 @@ class BetBuilderTab(QWidget):
         self.summary_label.setWordWrap(True)
         splitter.addWidget(self.summary_label)
 
-        # Market table
+        # Market table — 6 columns for compact horizontal layout
         self.table = QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["Category", "Selection", "Model Prob", "Fair Odds"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels([
+            "Category", "Selection", "", "", "", "",
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents)
+        for c in range(2, 6):
+            self.table.horizontalHeader().setSectionResizeMode(
+                c, QHeaderView.ResizeMode.Stretch)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
@@ -250,59 +255,84 @@ class BetBuilderTab(QWidget):
             f"1X2: {_pct(pred['p_home'])} / {_pct(pred['p_draw'])} / {_pct(pred['p_away'])}"
         )
 
-        # Build all market rows
-        rows = []
+        # ── Build compact row data ──
+        # Each entry: (category, selection, [(label, prob), ...])
+        # Up to 4 values per row — displayed across columns 2-5
+        groups: list[tuple[str, str, list[tuple[str, float]]]] = []
 
-        # ── 1X2 ──
-        rows.append(("1X2", "Home Win", pred["p_home"]))
-        rows.append(("1X2", "Draw", pred["p_draw"]))
-        rows.append(("1X2", "Away Win", pred["p_away"]))
+        # 1X2
+        groups.append(("1X2", "Home Win", [("", pred["p_home"])]))
+        groups.append(("1X2", "Draw", [("", pred["p_draw"])]))
+        groups.append(("1X2", "Away Win", [("", pred["p_away"])]))
 
-        # ── Goal Lines ──
-        for line, key_o, key_u in [
-            ("1.5", "p_over_15", "p_under_15"),
-            ("2.5", "p_over_25", "p_under_25"),
-            ("3.5", "p_over_35", "p_under_35"),
-            ("4.5", "p_over_45", "p_under_45"),
-        ]:
-            rows.append(("Goals", f"Over {line}", pred[key_o]))
-            rows.append(("Goals", f"Under {line}", pred[key_u]))
+        # Goal Lines — 2 rows: Over across, Under across
+        groups.append(("Goals", "Over", [
+            ("1.5", pred["p_over_15"]),
+            ("2.5", pred["p_over_25"]),
+            ("3.5", pred["p_over_35"]),
+            ("4.5", pred["p_over_45"]),
+        ]))
+        groups.append(("Goals", "Under", [
+            ("1.5", pred["p_under_15"]),
+            ("2.5", pred["p_under_25"]),
+            ("3.5", pred["p_under_35"]),
+            ("4.5", pred["p_under_45"]),
+        ]))
 
-        # ── BTTS ──
-        rows.append(("BTTS", "BTTS Yes", pred["p_btts_yes"]))
-        rows.append(("BTTS", "BTTS No", pred["p_btts_no"]))
+        # BTTS — single row with both
+        groups.append(("BTTS", "", [
+            ("Yes", pred["p_btts_yes"]),
+            ("No", pred["p_btts_no"]),
+        ]))
 
-        # ── Combo: BTTS + Result ──
-        rows.append(("BTTS + Result", f"BTTS & {home} Win", pred["p_btts_home"]))
-        rows.append(("BTTS + Result", "BTTS & Draw", pred["p_btts_draw"]))
-        rows.append(("BTTS + Result", f"BTTS & {away} Win", pred["p_btts_away"]))
+        # BTTS + Result — single row
+        groups.append(("BTTS + Result", "", [
+            (f"{home}", pred["p_btts_home"]),
+            ("Draw", pred["p_btts_draw"]),
+            (f"{away}", pred["p_btts_away"]),
+        ]))
 
-        # ── Combo: Result + O/U 2.5 ──
-        rows.append(("Result + O/U 2.5", f"{home} Win & Over 2.5", pred["p_home_o25"]))
-        rows.append(("Result + O/U 2.5", f"{home} Win & Under 2.5", pred["p_home_u25"]))
-        rows.append(("Result + O/U 2.5", "Draw & Over 2.5", pred["p_draw_o25"]))
-        rows.append(("Result + O/U 2.5", "Draw & Under 2.5", pred["p_draw_u25"]))
-        rows.append(("Result + O/U 2.5", f"{away} Win & Over 2.5", pred["p_away_o25"]))
-        rows.append(("Result + O/U 2.5", f"{away} Win & Under 2.5", pred["p_away_u25"]))
+        # Result + O/U 2.5 — 2 rows
+        groups.append(("Result + O/U", "Over 2.5", [
+            (f"{home}", pred["p_home_o25"]),
+            ("Draw", pred["p_draw_o25"]),
+            (f"{away}", pred["p_away_o25"]),
+        ]))
+        groups.append(("Result + O/U", "Under 2.5", [
+            (f"{home}", pred["p_home_u25"]),
+            ("Draw", pred["p_draw_u25"]),
+            (f"{away}", pred["p_away_u25"]),
+        ]))
 
-        # ── Combo: BTTS + O/U 2.5 ──
-        rows.append(("BTTS + O/U 2.5", "BTTS & Over 2.5", pred["p_btts_o25"]))
-        rows.append(("BTTS + O/U 2.5", "BTTS & Under 2.5", pred["p_btts_u25"]))
+        # BTTS + O/U 2.5
+        groups.append(("BTTS + O/U", "", [
+            ("BTTS & O2.5", pred["p_btts_o25"]),
+            ("BTTS & U2.5", pred["p_btts_u25"]),
+        ]))
 
-        # ── Team Totals ──
+        # Team Goals — 2 rows per team: Over across, Under across
         for label, prefix in [(home, "home"), (away, "away")]:
-            for line in ["0.5", "1.5", "2.5"]:
-                key_o = f"p_{prefix}_over_{line.replace('.', '')}"
-                key_u = f"p_{prefix}_under_{line.replace('.', '')}"
-                rows.append(("Team Goals", f"{label} Over {line}", pred[key_o]))
-                rows.append(("Team Goals", f"{label} Under {line}", pred[key_u]))
+            groups.append((f"{label} Goals", "Over", [
+                ("0.5", pred[f"p_{prefix}_over_05"]),
+                ("1.5", pred[f"p_{prefix}_over_15"]),
+                ("2.5", pred[f"p_{prefix}_over_25"]),
+            ]))
+            groups.append((f"{label} Goals", "Under", [
+                ("0.5", pred[f"p_{prefix}_under_05"]),
+                ("1.5", pred[f"p_{prefix}_under_15"]),
+                ("2.5", pred[f"p_{prefix}_under_25"]),
+            ]))
 
-        # ── Correct Score (top 10) ──
+        # Correct Score — pack 4 per row
         cs = pred.get("correct_scores", {})
-        for score, pct in sorted(cs.items(), key=lambda x: x[1], reverse=True)[:10]:
-            rows.append(("Correct Score", score, pct / 100.0))
+        cs_sorted = sorted(cs.items(), key=lambda x: x[1], reverse=True)[:12]
+        for chunk_start in range(0, len(cs_sorted), 4):
+            chunk = cs_sorted[chunk_start:chunk_start + 4]
+            groups.append(("Correct Score", "", [
+                (score, pct / 100.0) for score, pct in chunk
+            ]))
 
-        # ── Match Stats (corners, shots, cards) ──
+        # Match Stats — 2 rows per stat: Over across, Under across
         stats = pred.get("_stats")
         if stats:
             for key in ("corners", "shots", "sot", "yellows"):
@@ -310,50 +340,66 @@ class BetBuilderTab(QWidget):
                 if not info:
                     continue
                 label = info["label"]
-                cat = f"{label} (avg {info['total_expected']})"
-                for line_key, prob in info["lines"].items():
-                    # line_key like "over_8.5" or "under_9.5"
-                    parts = line_key.split("_", 1)
-                    ou = parts[0].title()
-                    val = parts[1]
-                    rows.append((cat, f"Total {label} {ou} {val}", prob))
+                cat = f"{label} ({info['total_expected']})"
+                lines = info["lines"]
+                # Sort line keys to extract the numeric lines in order
+                overs = sorted(
+                    [(k, v) for k, v in lines.items() if k.startswith("over_")],
+                    key=lambda x: float(x[0].split("_")[1]),
+                )
+                unders = sorted(
+                    [(k, v) for k, v in lines.items() if k.startswith("under_")],
+                    key=lambda x: float(x[0].split("_")[1]),
+                )
+                if overs:
+                    groups.append((cat, "Over", [
+                        (k.split("_")[1], v) for k, v in overs
+                    ]))
+                if unders:
+                    groups.append((cat, "Under", [
+                        (k.split("_")[1], v) for k, v in unders
+                    ]))
 
-        # Populate table
-        self.table.setRowCount(len(rows))
+        # ── Populate table ──
+        self.table.setRowCount(len(groups))
         bold_font = QFont()
         bold_font.setBold(True)
 
         prev_cat = ""
-        for i, (cat, selection, prob) in enumerate(rows):
-            # Category — only show on first row of group
+        for row_idx, (cat, selection, values) in enumerate(groups):
+            # Column 0: Category (show once per group)
             cat_item = QTableWidgetItem(cat if cat != prev_cat else "")
             if cat != prev_cat:
                 cat_item.setFont(bold_font)
-            cat_item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-            self.table.setItem(i, 0, cat_item)
+            cat_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            self.table.setItem(row_idx, 0, cat_item)
             prev_cat = cat
 
-            # Selection
+            # Column 1: Selection / direction
             sel_item = QTableWidgetItem(selection)
-            self.table.setItem(i, 1, sel_item)
+            sel_item.setFont(bold_font)
+            self.table.setItem(row_idx, 1, sel_item)
 
-            # Model probability
-            prob_item = QTableWidgetItem(_pct(prob))
-            prob_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            # Color-code by probability
-            if prob >= 0.6:
-                prob_item.setForeground(QColor("#4ade80"))  # green
-            elif prob >= 0.4:
-                prob_item.setForeground(QColor("#fbbf24"))  # amber
-            elif prob >= 0.2:
-                prob_item.setForeground(QColor("#f97316"))  # orange
-            else:
-                prob_item.setForeground(QColor("#94a3b8"))  # grey
-            self.table.setItem(i, 2, prob_item)
+            # Columns 2-5: values
+            for col_offset, (lbl, prob) in enumerate(values[:4]):
+                text = f"{lbl}:  {_pct(prob)}  ({_fair_odds(prob)})" if lbl else \
+                       f"{_pct(prob)}  ({_fair_odds(prob)})"
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                # Color by probability
+                if prob >= 0.6:
+                    item.setForeground(QColor("#4ade80"))
+                elif prob >= 0.4:
+                    item.setForeground(QColor("#fbbf24"))
+                elif prob >= 0.2:
+                    item.setForeground(QColor("#f97316"))
+                else:
+                    item.setForeground(QColor("#94a3b8"))
+                self.table.setItem(row_idx, 2 + col_offset, item)
 
-            # Fair odds
-            odds_item = QTableWidgetItem(_fair_odds(prob))
-            odds_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(i, 3, odds_item)
+            # Clear unused columns
+            for col_offset in range(len(values), 4):
+                self.table.setItem(row_idx, 2 + col_offset, QTableWidgetItem(""))
 
         self.table.resizeRowsToContents()
