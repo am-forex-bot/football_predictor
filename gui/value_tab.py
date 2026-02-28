@@ -252,14 +252,14 @@ class ValueTab(QWidget):
         # Value bets table
         self.vb_table = QTableWidget()
         cols = [
-            "Match", "Market", "Selection", "Model %", "Implied %",
+            "Date", "Match", "Market", "Selection", "Model %", "Implied %",
             "Edge %", "Bet365 Odds", "Kelly Stake", "EV (£)", "xG",
             "Confidence",
         ]
         self.vb_table.setColumnCount(len(cols))
         self.vb_table.setHorizontalHeaderLabels(cols)
         self.vb_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch
+            1, QHeaderView.ResizeMode.Stretch  # Match column stretches
         )
         self.vb_table.setAlternatingRowColors(True)
         self.vb_table.setSortingEnabled(True)
@@ -662,6 +662,20 @@ class ValueTab(QWidget):
 
         results_df, fixtures_df, table_df = data
 
+        # Filter to future fixtures only — drop historical unresulted matches
+        if "Date" in fixtures_df.columns:
+            dates = pd.to_datetime(fixtures_df["Date"], dayfirst=True, errors="coerce")
+            today = pd.Timestamp.now().normalize()
+            future_mask = dates.isna() | (dates >= today)
+            n_before = len(fixtures_df)
+            fixtures_df = fixtures_df.loc[future_mask].reset_index(drop=True)
+            n_dropped = n_before - len(fixtures_df)
+            if n_dropped > 0:
+                self.main_window.set_status(
+                    f"Filtered to {len(fixtures_df)} upcoming fixtures "
+                    f"(dropped {n_dropped} past matches)"
+                )
+
         # Fetch live odds and merge into fixtures
         fixtures_df = self._fetch_live_odds(code, fixtures_df)
 
@@ -760,6 +774,12 @@ class ValueTab(QWidget):
 
     def _display_value_bets(self, bets: list):
         """Populate the value bets table."""
+        # Sort bets by date first, then by EV within each date
+        bets = sorted(bets, key=lambda b: (
+            b.get("date") or pd.Timestamp("2099-01-01"),
+            -b.get("expected_value", 0),
+        ))
+
         self.vb_table.setSortingEnabled(False)
         self.vb_table.setRowCount(len(bets))
 
@@ -767,20 +787,34 @@ class ValueTab(QWidget):
         total_ev = 0
 
         for row, b in enumerate(bets):
+            # Date
+            date_val = b.get("date")
+            if date_val is not None and pd.notna(date_val):
+                try:
+                    date_str = pd.Timestamp(date_val).strftime("%d %b")
+                except Exception:
+                    date_str = ""
+            else:
+                date_str = ""
+            date_item = QTableWidgetItem(date_str)
+            date_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.vb_table.setItem(row, 0, date_item)
+
+            # Match
             match_text = f"{b['home_team']} vs {b['away_team']}"
-            self.vb_table.setItem(row, 0, QTableWidgetItem(match_text))
-            self.vb_table.setItem(row, 1, QTableWidgetItem(b["market"]))
-            self.vb_table.setItem(row, 2, QTableWidgetItem(b["selection"]))
+            self.vb_table.setItem(row, 1, QTableWidgetItem(match_text))
+            self.vb_table.setItem(row, 2, QTableWidgetItem(b["market"]))
+            self.vb_table.setItem(row, 3, QTableWidgetItem(b["selection"]))
 
             # Model probability
             mp_item = QTableWidgetItem(f"{b['model_prob']:.1f}%")
             mp_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.vb_table.setItem(row, 3, mp_item)
+            self.vb_table.setItem(row, 4, mp_item)
 
             # Implied probability
             ip_item = QTableWidgetItem(f"{b['implied_prob']:.1f}%")
             ip_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.vb_table.setItem(row, 4, ip_item)
+            self.vb_table.setItem(row, 5, ip_item)
 
             # Edge — color code
             edge_item = QTableWidgetItem(f"{b['edge']:.1f}%")
@@ -791,17 +825,17 @@ class ValueTab(QWidget):
                 edge_item.setForeground(QColor("#fbbf24"))  # Gold for decent edge
             else:
                 edge_item.setForeground(QColor("#a6adc8"))
-            self.vb_table.setItem(row, 5, edge_item)
+            self.vb_table.setItem(row, 6, edge_item)
 
             # Best odds
             odds_item = QTableWidgetItem(f"{b['best_odds']:.2f}")
             odds_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.vb_table.setItem(row, 6, odds_item)
+            self.vb_table.setItem(row, 7, odds_item)
 
             # Kelly stake
             stake_item = QTableWidgetItem(f"£{b['kelly_stake']:.2f}")
             stake_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.vb_table.setItem(row, 7, stake_item)
+            self.vb_table.setItem(row, 8, stake_item)
             total_stake += b["kelly_stake"]
 
             # Expected value
@@ -809,14 +843,14 @@ class ValueTab(QWidget):
             ev_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             if b["expected_value"] > 0:
                 ev_item.setForeground(QColor("#22c55e"))
-            self.vb_table.setItem(row, 8, ev_item)
+            self.vb_table.setItem(row, 9, ev_item)
             total_ev += b["expected_value"]
 
             # xG
             xg_text = f"{b['home_xg']:.1f} - {b['away_xg']:.1f}"
             xg_item = QTableWidgetItem(xg_text)
             xg_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.vb_table.setItem(row, 9, xg_item)
+            self.vb_table.setItem(row, 10, xg_item)
 
             # Confidence rating
             conf = b.get("confidence", "LOW")
@@ -828,7 +862,7 @@ class ValueTab(QWidget):
                 conf_item.setForeground(QColor("#fbbf24"))
             else:
                 conf_item.setForeground(QColor("#a6adc8"))
-            self.vb_table.setItem(row, 10, conf_item)
+            self.vb_table.setItem(row, 11, conf_item)
 
             # Row color based on market
             if b["selection"] == "Home Win":
