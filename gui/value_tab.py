@@ -490,7 +490,10 @@ class ValueTab(QWidget):
                 )
                 self.odds_status.setStyleSheet("color: #22c55e; font-size: 11px;")
             else:
-                self.odds_status.setText("No API key — no odds available")
+                self.odds_status.setText(
+                    "No API key and no Bet365 odds in fixtures — "
+                    "re-download league to fetch prices from football-data.co.uk"
+                )
                 self.odds_status.setStyleSheet("color: #fbbf24; font-size: 11px;")
             return fixtures_df
 
@@ -544,7 +547,8 @@ class ValueTab(QWidget):
                 else:
                     msg = (
                         f"{source}  |  "
-                        f"No Bet365 odds available from any source  |  "
+                        f"No Bet365 odds available — re-download the league "
+                        f"to fetch latest Bet365 prices from football-data.co.uk  |  "
                         f"API calls left: {remaining}"
                     )
                     self.odds_status.setText(msg)
@@ -904,10 +908,10 @@ class ValueTab(QWidget):
             )
         else:
             self.vb_summary.setText(
-                "No value bets found — this needs bookmaker odds to calculate edge.\n"
-                "Check the Match Probabilities tab for model predictions on all fixtures.\n"
-                "If odds are missing, re-download the league to fetch the latest prices.\n"
-                "Use the Backtest button to test if the model has edge on this league."
+                "No value bets found — bookmaker odds are needed to calculate edge.\n"
+                "Re-download the league (Download tab) to fetch Bet365 odds from football-data.co.uk.\n"
+                "Check Match Probabilities tab for model predictions (works without odds).\n"
+                "Use Backtest to verify the model has edge on this league before betting."
             )
 
     def _display_predictions(self, predictions: list):
