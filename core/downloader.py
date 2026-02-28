@@ -39,7 +39,28 @@ def _fetch_csv(url: str, retries: int = 5) -> str:
         try:
             resp = session.get(url, timeout=15)
             if resp.status_code == 200:
-                return resp.text
+                # Try UTF-8-sig decoding first (handles BOM natively),
+                # then fall back to whatever requests detected.
+                try:
+                    text = resp.content.decode("utf-8-sig")
+                except (UnicodeDecodeError, LookupError):
+                    text = resp.text
+
+                # Reject HTML responses masquerading as 200 OK
+                # (Cloudflare challenge pages, error pages, etc.)
+                stripped = text.strip()
+                if stripped[:10].lower().startswith(
+                    ("<!doctype", "<html", "<head", "<?xml", "<body")
+                ):
+                    log.warning(
+                        "Response from %s is HTML, not CSV. First 120 chars: %s",
+                        url, stripped[:120],
+                    )
+                    raise RuntimeError(
+                        f"Received HTML instead of CSV from {url} "
+                        f"(site may be blocking automated requests)"
+                    )
+                return text
             raise requests.HTTPError(f"HTTP {resp.status_code}")
         except requests.RequestException as exc:
             if attempt == retries - 1:
@@ -49,10 +70,27 @@ def _fetch_csv(url: str, retries: int = 5) -> str:
 
 
 def _parse_csv_text(text: str) -> pd.DataFrame:
-    """Parse CSV text, handling BOM and encoding issues."""
+    """Parse CSV text, handling BOM, encoding issues, and column whitespace."""
+    # Strip BOM variants
     if text.startswith("\ufeff"):
         text = text[1:]
-    return pd.read_csv(StringIO(text))
+
+    # Skip any leading blank lines
+    lines = text.split("\n")
+    start = 0
+    for i, line in enumerate(lines):
+        if line.strip():
+            start = i
+            break
+    if start > 0:
+        text = "\n".join(lines[start:])
+
+    df = pd.read_csv(StringIO(text))
+
+    # Strip whitespace from column names (some CSVs have " Div" instead of "Div")
+    df.columns = [c.strip() for c in df.columns]
+
+    return df
 
 
 def download_results(league_code: str, season: str | None = None) -> pd.DataFrame:
@@ -84,9 +122,37 @@ def download_results_multi(league_code: str, n_seasons: int = 5,
 
 
 def download_fixtures() -> pd.DataFrame:
-    """Download the global fixtures.csv from football-data.co.uk."""
+    """Download the global fixtures.csv from football-data.co.uk.
+
+    Returns DataFrame with columns: Div, Date, Time, HomeTeam, AwayTeam,
+    B365H, B365D, B365A, and many more bookmaker odds.
+    """
     text = _fetch_csv(FIXTURES_URL)
-    return _parse_csv_text(text)
+
+    # Log first line (header) for debugging
+    first_line = text.strip().split("\n")[0] if text.strip() else "(empty)"
+    log.info("fixtures.csv header: %s", first_line[:200])
+
+    df = _parse_csv_text(text)
+    log.info("fixtures.csv parsed: %d rows, %d cols. Columns: %s",
+             len(df), len(df.columns), list(df.columns)[:15])
+
+    # Handle case-insensitive column names
+    if "Div" not in df.columns:
+        for col in df.columns:
+            if col.lower() == "div":
+                df = df.rename(columns={col: "Div"})
+                log.info("Renamed column %r → 'Div'", col)
+                break
+
+    if "Div" not in df.columns:
+        log.error(
+            "fixtures.csv has NO 'Div' column after parsing. "
+            "All columns: %s. First line was: %s",
+            list(df.columns), first_line[:200],
+        )
+
+    return df
 
 
 def _merge_fixtures_with_odds(of_df: pd.DataFrame, fd_df: pd.DataFrame) -> pd.DataFrame:
@@ -294,11 +360,35 @@ class DownloadWorker(QObject):
                             f"(columns: {', '.join(b365_cols) or 'none'})"
                         )
                     else:
-                        self.progress.emit("  No odds data for this league on football-data.")
+                        divs = sorted(all_fixtures["Div"].dropna().unique().tolist())
+                        self.progress.emit(
+                            f"  No fixtures for '{self.league_code}' on football-data. "
+                            f"Available leagues: {', '.join(str(d) for d in divs[:15])}"
+                        )
                 else:
-                    self.progress.emit("  Odds source: no Div column found.")
+                    cols_preview = list(all_fixtures.columns)[:10]
+                    self.progress.emit(
+                        f"  Odds source: no Div column found "
+                        f"({len(all_fixtures)} rows, {len(all_fixtures.columns)} cols). "
+                        f"Columns: {cols_preview}  — site may have returned a "
+                        f"non-CSV response (blocked/Cloudflare)."
+                    )
             except Exception as e:
                 self.progress.emit(f"  football-data download failed: {e}")
+
+            # Fallback: if fixtures.csv failed, try to extract upcoming
+            # fixtures with B365 odds from the current season CSV.
+            # The season CSV (e.g. E0.csv) often has upcoming rows with odds.
+            if fd_fixtures.empty and "B365H" in current_df.columns:
+                ftr_mask = current_df["FTR"].isna() | (current_df["FTR"] == "")
+                csv_upcoming = current_df.loc[ftr_mask].copy()
+                n_csv_odds = int(csv_upcoming["B365H"].notna().sum())
+                if n_csv_odds > 0:
+                    fd_fixtures = csv_upcoming
+                    self.progress.emit(
+                        f"  Fallback: {len(csv_upcoming)} upcoming fixtures "
+                        f"with {n_csv_odds} B365 odds from season CSV"
+                    )
 
             # Combine fixtures: football-data (with odds) is PRIMARY,
             # openfootball supplements with extra fixtures.

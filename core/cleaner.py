@@ -261,12 +261,12 @@ def extract_fixtures(raw_df: pd.DataFrame,
     is_future_only = False
     if date_col is not None:
         dates = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
-        tomorrow = pd.Timestamp.now().normalize() + pd.Timedelta(days=1)
-        future_mask = dates.isna() | (dates >= tomorrow)
+        today = pd.Timestamp.now().normalize()
+        future_mask = dates.isna() | (dates >= today)
         future_df = df.loc[future_mask]
 
         n_b365_future = int(future_df["B365H"].notna().sum()) if b365_present and not future_df.empty else 0
-        log.info("extract_fixtures: %d future rows (of %d), B365H non-null=%d",
+        log.info("extract_fixtures: %d today+ rows (of %d), B365H non-null=%d",
                  len(future_df), len(df), n_b365_future)
 
         if len(future_df) > 0:
